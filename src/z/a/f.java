@@ -39,6 +39,8 @@ import java.io.OutputStreamWriter;
  *   音量加 短按 = 扫描          音量加 按住 3.0s = 复制结果
  *   音量减 短按 = 显示/隐藏     音量减 按住 5.0s = 解锁触摸 20s（可拖动/点按钮）
  * 解锁窗口倒计时结束自动上锁，保证「对局中」这一常态下窗口始终不可触摸。
+ * 既然平时点不到，那「扫描 / 复制 / 收起 / ✕」这些按钮平时就一并隐藏（applyTouchUi），
+ * 免得摆在那儿只能当装饰、还让人以为能点；解锁那 20 秒里才露出来。
  *
  * 清单里自带 android.permission.SYSTEM_ALERT_WINDOW，所以只需要用户在系统设置里
  * 授权一次「显示在其他应用上层」；未授权时退化为 Toast。
@@ -62,6 +64,10 @@ public final class f {
     private static TextView sBody;
     private static Button sScanBtn;
     private static TextView sTitle;
+    /** 「扫描 / 复制 / 收起」那一行：只在解锁触摸时才显示（见 applyTouchUi）。 */
+    private static LinearLayout sBtnRow;
+    /** 标题行右侧的「✕」（最小化）：同样只在解锁触摸时才显示。 */
+    private static Button sCloseBtn;
     private static WindowManager.LayoutParams sParams;
     private static volatile boolean sScanning;
     /** 已被音量减键摘下来（窗口不在 WindowManager 里）。 */
@@ -245,6 +251,10 @@ public final class f {
             }
         });
         bar.addView(closeBtn);
+        // 平时（窗口不可触摸）不显示：点了没反应的按钮既是视觉噪音，也让人以为能点。
+        // 只有音量减长按解锁的那 20 秒里才露出来（见 applyTouchUi）。
+        closeBtn.setVisibility(View.GONE);
+        sCloseBtn = closeBtn;
         sPanel.addView(bar);
 
         // 第二行：三个按钮等分
@@ -304,6 +314,8 @@ public final class f {
             }
         });
         bar2.addView(hideBtn);
+        bar2.setVisibility(View.GONE);
+        sBtnRow = bar2;
         sPanel.addView(bar2);
 
         ScrollView scroll = new ScrollView(ctx);
@@ -317,7 +329,7 @@ public final class f {
         sBody.setTextSize(13f);
         sBody.setText("音量加 短按=扫描 · 按住 3 秒=复制\n"
                 + "音量减 短按=显示/隐藏 · 按住 5 秒=解锁触摸 20 秒\n"
-                + "窗口默认不可触摸（点不到），解锁后可拖动/点按钮");
+                + "平时窗口不可触摸（按钮已隐藏），解锁后才出现按钮、可拖动");
         sBody.setPadding(0, dp(ctx, 6), 0, 0);
         scroll.addView(sBody);
         sPanel.addView(scroll);
@@ -456,6 +468,7 @@ public final class f {
             return;
         }
         try {
+            applyTouchUi(on);
             int flags = sParams.flags;
             if (on) {
                 flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
@@ -472,6 +485,40 @@ public final class f {
         } catch (Throwable t) {
             i.w("切换触摸性失败：" + t);
         }
+    }
+
+    /**
+     * 按钮可见性跟随「是否解锁触摸」。
+     *
+     * 为什么：窗口平时是 FLAG_NOT_TOUCHABLE，按钮摆在那儿也点不到 —— 既占地方，
+     * 又让人误以为能点。所以平时面板上只留标题和结果（外加一行手势提示），
+     * 只有按住音量减解锁的那 20 秒里，才把「扫描 / 复制 / 收起 / ✕」露出来。
+     */
+    private static void applyTouchUi(final boolean unlocked) {
+        MAIN.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (sBtnRow != null) {
+                        sBtnRow.setVisibility(unlocked ? View.VISIBLE : View.GONE);
+                    }
+                    if (sCloseBtn != null) {
+                        sCloseBtn.setVisibility(unlocked ? View.VISIBLE : View.GONE);
+                    }
+                    if (unlocked) {
+                        // 解锁 = 用户明确想操作，那就把最小化 / 隐藏状态一并还原，
+                        // 否则「解锁成功但屏幕上什么都没有」比不解锁更让人困惑。
+                        if (sHidden) {
+                            showAll();
+                        } else if (sMinimized) {
+                            restore();
+                        }
+                    }
+                } catch (Throwable t) {
+                    i.w("切换按钮可见性失败：" + t);
+                }
+            }
+        });
     }
 
     /** 解锁触摸 UNLOCK_SECONDS 秒，期间标题显示倒计时，到点自动上锁。 */
