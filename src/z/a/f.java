@@ -37,7 +37,8 @@ import java.io.OutputStreamWriter;
  *
  * 代价是不可触摸的窗口既点不到按钮也拖不动，所以交互全部改由音量键驱动（见 g）：
  *   音量加 短按 = 扫描          音量加 按住 3.0s = 复制结果
- *   音量减 短按 = 显示/隐藏     音量减 按住 5.0s = 解锁触摸 20s（可拖动/点按钮）
+ *   音量减 短按 = 收起面板      音量减 按住 5.0s = 解锁触摸 10s（可拖动/点按钮）
+ * 面板收起后音量键就还给系统（音量加除外：它负责把面板叫回来，并自动补一次音量）。
  * 解锁窗口倒计时结束自动上锁，保证「对局中」这一常态下窗口始终不可触摸。
  * 既然平时点不到，那「扫描 / 复制 / 收起 / ✕」这些按钮平时就一并隐藏（applyTouchUi），
  * 免得摆在那儿只能当装饰、还让人以为能点；解锁那 20 秒里才露出来。
@@ -81,8 +82,14 @@ public final class f {
     private static int sAttempts;
     /** 「点」与「拖」的分界：位移超过这么多 px 就算拖动，不再当成点击。 */
     private static final int TAP_SLOP = 12;
-    /** 解锁后保持可触摸的秒数。 */
-    private static final int UNLOCK_SECONDS = 20;
+    /**
+     * 解锁后保持可触摸的秒数。
+     *
+     * 为什么不给太长：可触摸 = 面板范围内的触摸会被我们吃掉、游戏也不可避免地看到
+     * 「有东西盖着」（FLAG_WINDOW_IS_OBSCURED），所以这个窗口越短越安全。
+     * 10 秒足够「拖一下位置 / 点一下复制」；不够就再按一次（按住音量减 5 秒）。
+     */
+    private static final int UNLOCK_SECONDS = 10;
     /** 面板默认标题。 */
     private static final String TITLE = "模仿者·直装";
 
@@ -328,8 +335,8 @@ public final class f {
         sBody.setTextColor(0xFFEEEEEE);
         sBody.setTextSize(13f);
         sBody.setText("音量加 短按=扫描 · 按住 3 秒=复制\n"
-                + "音量减 短按=显示/隐藏 · 按住 5 秒=解锁触摸 20 秒\n"
-                + "平时窗口不可触摸（按钮已隐藏），解锁后才出现按钮、可拖动");
+                + "音量减 短按=收起/显示 · 按住 5 秒=解锁触摸 10 秒\n"
+                + "收起后音量键交给系统；按一下音量加把面板叫回来");
         sBody.setPadding(0, dp(ctx, 6), 0, 0);
         scroll.addView(sBody);
         sPanel.addView(scroll);
@@ -528,6 +535,9 @@ public final class f {
         sUnlockLeft = UNLOCK_SECONDS;
         setTitleText("已解锁 " + sUnlockLeft + "s");
         MAIN.postDelayed(TICK, 1000L);
+        // 必须给反馈：解锁意味着「这 10 秒里窗口会吃掉它范围内的触摸」，
+        // 悄悄切换状态比不解锁更糟（用户会以为游戏点不动了）。
+        toast("已解锁触摸 " + UNLOCK_SECONDS + " 秒：可拖动面板 / 点按钮");
     }
 
     /** 立即上锁。 */
