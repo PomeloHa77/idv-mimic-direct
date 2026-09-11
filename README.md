@@ -30,7 +30,7 @@
 |---|---|---|
 | 文件 | `out/第五人格-共存版-2026.0828.1653.apk` | `out/第五人格-直装版-2026.0828.1653.apk` |
 | 大小 | 2 012 880 681 B | 同流程产出，清单不延长故略小 |
-| SHA-256 | `c7a977960fa9d79d0afe284ec5d5ee1b53a4d5c5c75737143680ea1b7e5c375d` | 见构建输出 |
+| SHA-256 | `e0b64902a8b69f687933e56447475ede2a34251571b2a1e5ff68a32657e2c860` | 见构建输出 |
 | 包名 | **`com.netease.dwrg.fj`** | `com.netease.dwrg`（与官方一致） |
 | 与官方包共存 | 可以，可同时安装、同时登录 | 不行，必须先卸载官方包 |
 
@@ -51,7 +51,7 @@ pwsh -File build.ps1 -OriginalPackage # 直装版（包名与官方一致，需�
 
 | # | 原来的暴露面 | 谁看得见 | 处置 | 验证方式 |
 |---|---|---|---|---|
-| 1 | dex 明文特征：`模仿者`/`第五人格`/`FJDirect`/`com/fj/direct`/`scan.txt`/`狼人`/`侦探团`/`神秘客`/`阵营`/角色名 | 任何把它拖进 jadx 的人 | **中性短类名 + 全部字符串字面量密文化**（2.2 节） | 构建期 `check_stealth dex` 硬断言；剩余可打印串 354 条，全是类名/字段名等结构性内容 |
+| 1 | dex 明文特征：`模仿者`/`第五人格`/`FJDirect`/`com/fj/direct`/`scan.txt`/`狼人`/`侦探团`/`神秘客`/`阵营`/角色名 | 任何把它拖进 jadx 的人 | **中性短类名 + 全部字符串字面量密文化**（2.2 节） | 构建期 `check_stealth dex` 硬断言；剩余可打印串 355 条，全是类名/字段名等结构性内容 |
 | 2 | logcat 自曝：`I FJDirect: 悬浮窗已创建 …` | 同一个进程 `logcat -d` 就能读到 | **日志门面 `z.a.i`**，release 下 `ON` 是编译期常量 `false`，`javac` 把整块日志消掉（2.6 节） | 真机 release 跑完启动 + 扫描，logcat **0 行**相关输出 |
 | 3 | 结果落盘 `files/scan.txt`（文本、中文、带包名目录） | 任何文件管理器 / 备份 / 云同步 | release **不落盘**；只有 `-DebugBuild` 才写，且改名 `log.txt` | 真机 `ls /sdcard/Android/data/com.netease.dwrg.fj/files/` 无该文件 |
 | 4 | 悬浮窗「被遮挡」标记：窗口可触摸 → 下层游戏窗口的触摸事件带 `FLAG_WINDOW_IS_OBSCURED`（Android 12+ 若游戏窗口是 `BLOCK_UNTRUSTED`，触摸甚至被直接丢弃） | 游戏进程自己（`MotionEvent.getFlags()`） | **窗口全程 `FLAG_NOT_FOCUSABLE \| FLAG_NOT_TOUCHABLE`**：看得见、点不到、不参与命中测试（2.4 节） | `dumpsys input` 里我们的窗口 `inputConfig=NOT_FOCUSABLE \| NOT_TOUCHABLE`、游戏窗口 `inputConfig=0x0`；探针实测游戏侧 `flags=0x100000`（无 bit0） |
@@ -370,10 +370,10 @@ pwsh -File build.ps1 -OutName x.apk   # 自定义产物名
 | `zipalign -c -v 4` | `Verification successful` |
 | `aapt2 dump badging` | `com.netease.dwrg.fj` / `262401653` / `2026.0828.1653` / `minSdk 21` / `targetSdk 30` / 含 `SYSTEM_ALERT_WINDOW` / `native-code: 'arm64-v8a'` |
 | `resources.arsc` | 包名 `com.netease.dwrg.fj`，STORED，3 788 696 B 不变 |
-| `classes13.dex` | magic `dex\n035`，46 064 B，`dexdump -f` 正常 |
+| `classes13.dex` | magic `dex\n035`，46 056 B，`dexdump -f` 正常 |
 | `libnrt.so` | aarch64 ELF、4 904 B、动态符号只有 `JNI_OnLoad` |
 | 共存性 | authorities 31 / 31、自定义 permission 3 / 3，**无交集** |
-| `check_stealth dex` | 无禁用明文；剩余可打印串 354 条（类名 / 字段名等结构性内容） |
+| `check_stealth dex` | 无禁用明文；剩余可打印串 355 条（类名 / 字段名等结构性内容） |
 | `check_stealth collide` | 9 个类名与官方 12 个 dex 无冲突 |
 | `check_stealth libname` / `so` | 不与原包 lib 重名；无 `Java_` / 旧库名 / 品牌字样 / 绑定类名 |
 | 字符串自检 | `decode-check 248/248 OK` |
