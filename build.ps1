@@ -13,9 +13,11 @@
 [CmdletBinding()]
 param(
     [string]$SrcApk = "E:\Dev\workspace\idv\netease_dwrg_20260903.apk",
-    [string]$OutName = "第五人格-直装版-2026.0828.1653.apk",
+    [string]$OutName = "",
     [switch]$SkipDecompile,
-    [switch]$V2Only
+    [switch]$V2Only,
+    # 共存版：把包名改成 com.netease.dwrg.fj，可与官方包同时安装（默认）
+    [switch]$OriginalPackage
 )
 
 $ErrorActionPreference = 'Stop'
@@ -72,6 +74,11 @@ $Keystore = Join-Path $Root 'libs\direct.keystore'
 $KsAlias  = 'fjdirect'
 $KsPass   = 'fjdirect'
 
+if (-not $OutName) {
+    $OutName = if ($OriginalPackage) { "第五人格-直装版-2026.0828.1653.apk" }
+               else { "第五人格-共存版-2026.0828.1653.apk" }
+}
+
 $Work = Join-Path $Root 'work'
 $Out  = Join-Path $Root 'out'
 foreach ($d in @($Work, $Out, (Join-Path $Work 'smali'), (Join-Path $Work 'java-classes'),
@@ -117,9 +124,25 @@ if ($SkipDecompile -and (Test-Path (Join-Path $SmaliDir 'com'))) {
 }
 
 # --------------------------------------------------------------- 3. 打补丁
-Step 3 '打补丁（注入入口 + 签名回填）'
-& $Python -X utf8 (Join-Path $Root 'tools\patch_dex.py') $SmaliDir
+Step 3 '打补丁（注入入口 + 签名回填 + 共存包名）'
+$pkgArgs = @()
+if ($OriginalPackage) { $pkgArgs += '--keep-package' }
+& $Python -X utf8 (Join-Path $Root 'tools\patch_dex.py') $SmaliDir @pkgArgs
 if ($LASTEXITCODE -ne 0) { throw 'patch_dex.py 失败' }
+
+# 共存版必须同时改清单：package 属性 + 全部 authorities + <permission> 声明。
+# 只改 dex 没用；只改 manifest 的 package 而不改 authorities 会让第二个包
+# 装不上（INSTALL_FAILED_CONFLICTING_PROVIDER）。
+$replaceArgs = @()
+if (-not $OriginalPackage) {
+    Step '3b' '改写 AndroidManifest.xml（共存版包名）'
+    $ManifestPatch = Join-Path $Work 'AndroidManifest.patched.xml'
+    & $Python -X utf8 (Join-Path $Root 'tools\coexist.py') patch $SrcApk $ManifestPatch
+    if ($LASTEXITCODE -ne 0) { throw 'coexist.py 失败' }
+    $replaceArgs += '--replace'
+    $replaceArgs += "AndroidManifest.xml=$ManifestPatch"
+    Ok $ManifestPatch
+}
 
 # --------------------------------------------------------- 4. 回编译 classes.dex
 Step 4 'smali -> classes.patched.dex'
@@ -148,7 +171,7 @@ Ok ((Get-Item $ExtraDex).Length.ToString() + ' B -> classes13.dex')
 Step 7 '重打包（保序保压缩方式，丢弃旧 v1 签名）'
 $Unsigned = Join-Path $Work 'app-unsigned.apk'
 & $Python -X utf8 (Join-Path $Root 'tools\repack.py') $SrcApk $Unsigned `
-    --classes-dex $PatchedDex --extra-dex "classes13.dex=$ExtraDex" --drop-v1-signature
+    --classes-dex $PatchedDex --extra-dex "classes13.dex=$ExtraDex" --drop-v1-signature @replaceArgs
 if ($LASTEXITCODE -ne 0) { throw 'repack 失败' }
 
 # ------------------------------------------------------------- 8. zipalign
@@ -196,6 +219,42 @@ Write-Host '  Verification successful'
 Write-Host '  -- aapt2 dump badging（包名 / 版本 / 权限）--'
 $badging = & $Aapt2 dump badging $Final
 $badging | Select-String "^package:|SYSTEM_ALERT_WINDOW|sdkVersion|targetSdkVersion|native-code"
+$pkgLine = ($badging | Select-String "^package: name='([^']+)'").Matches.Groups[1].Value
+Write-Host ("  实际包名: " + $pkgLine)
+if ($OriginalPackage) {
+    if ($pkgLine -ne 'com.netease.dwrg') { throw "包名应为 com.netease.dwrg，实际 $pkgLine" }
+} else {
+    if ($pkgLine -ne 'com.netease.dwrg.fj') { throw "共存版包名应为 com.netease.dwrg.fj，实际 $pkgLine" }
+}
+
+# 共存性的硬指标：两个包的 authorities 与自定义 <permission> 不能有交集，
+# 否则第二个包会 INSTALL_FAILED_CONFLICTING_PROVIDER / DUPLICATE_PERMISSION。
+Write-Host '  -- 与官方包共存性检查 --'
+function Get-ManifestFacts([string]$Apk) {
+    $tree = & $Aapt2 dump xmltree --file AndroidManifest.xml $Apk
+    $auth = New-Object System.Collections.Generic.List[string]
+    $perm = New-Object System.Collections.Generic.List[string]
+    $pkg = ''
+    for ($i = 0; $i -lt $tree.Count; $i++) {
+        if ($tree[$i] -match 'android:authorities\(0x01010018\)="([^"]*)"') { $auth.Add($Matches[1]) }
+        if ($tree[$i] -match '\bA: package="([^"]*)"') { $pkg = $Matches[1] }
+        if ($tree[$i] -match '^ {6}E: permission \(line=') {
+            for ($j = $i + 1; $j -lt [Math]::Min($i + 5, $tree.Count); $j++) {
+                if ($tree[$j] -match 'android:name\(0x01010003\)="([^"]*)"') { $perm.Add($Matches[1]); break }
+            }
+        }
+    }
+    [pscustomobject]@{ Package = $pkg; Authorities = $auth; Permissions = $perm }
+}
+$nw = Get-ManifestFacts $Final
+$og = Get-ManifestFacts $SrcApk
+Write-Host ("  官方 authorities {0} 条 / 自定义 permission {1} 条" -f $og.Authorities.Count, $og.Permissions.Count)
+Write-Host ("  新包 authorities {0} 条 / 自定义 permission {1} 条" -f $nw.Authorities.Count, $nw.Permissions.Count)
+$bad = @()
+foreach ($a in $nw.Authorities) { if ($og.Authorities -contains $a) { $bad += "authority 冲突: $a" } }
+foreach ($p in $nw.Permissions) { if ($og.Permissions -contains $p) { $bad += "permission 冲突: $p" } }
+if ($bad.Count) { $bad | ForEach-Object { Write-Host ("  !! " + $_) }; throw '共存性检查失败' }
+Write-Host '  无交集 OK'
 
 Write-Host '  -- dex 校验 --'
 $extraCheck = Join-Path $Work 'check-classes13.dex'
@@ -214,4 +273,11 @@ if ($LASTEXITCODE -ne 0) { throw 'classes13.dex 校验失败' }
 & $Dexdump -f $extraCheck | Select-String 'Opened|header' | Select-Object -First 3
 
 Write-Host "`n构建完成：$Final" -ForegroundColor Green
-Write-Host "安装：adb uninstall com.netease.dwrg; adb install -r `"$Final`"" -ForegroundColor Green
+if ($OriginalPackage) {
+    Write-Host "安装（与官方包冲突，必须先卸载官方包）：" -ForegroundColor Green
+    Write-Host "  adb uninstall com.netease.dwrg" -ForegroundColor Green
+    Write-Host "  adb install -r `"$Final`"" -ForegroundColor Green
+} else {
+    Write-Host "安装（共存版，可与官方包同时安装，无需卸载任何东西）：" -ForegroundColor Green
+    Write-Host "  adb install -r `"$Final`"" -ForegroundColor Green
+}
