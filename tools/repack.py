@@ -117,7 +117,10 @@ def main():
     ap.add_argument("--extra-dex", action="append", default=[],
                     help="形如 classes13.dex=路径，可重复")
     ap.add_argument("--replace", action="append", default=[],
-                    help="形如 AndroidManifest.xml=路径，用新内容替换该条目（deflate），可重复")
+                    help="形如 AndroidManifest.xml=路径，用新内容替换该条目"
+                         "（保持原压缩方式；arsc 必须保持 STORED），可重复")
+    ap.add_argument("--add", action="append", default=[],
+                    help="形如 lib/arm64-v8a/libmmread.so=路径，向包里新增一个条目（deflate），可重复")
     ap.add_argument("--drop-v1-signature", action="store_true",
                     help="丢弃原包 META-INF 下的 v1 签名文件（MANIFEST.MF/*.SF/*.RSA/*.DSA），"
                          "避免重签后残留旧签名文件导致 v1 校验失败或被识别为多签名者")
@@ -132,6 +135,10 @@ def main():
     for spec in args.extra_dex:
         name, _, path = spec.partition("=")
         extras.append((name, open(path, "rb").read()))
+    adds = []
+    for spec in args.add:
+        name, _, path = spec.partition("=")
+        adds.append((name, open(path, "rb").read()))
 
     src_size = os.path.getsize(args.src)
     with open(args.src, "rb") as f, open(args.dst, "wb") as o:
@@ -163,10 +170,15 @@ def main():
                 name = e.name.decode("utf-8", "replace")
                 if name in replaces:
                     payload = replaces[name]
-                    comp = deflate(payload)
+                    # 保持原条目的压缩方式：resources.arsc 必须是 STORED
+                    # （Android 11+ 强制 arsc 未压缩 + 4 字节对齐，压了会装不上），
+                    # classes.dex 原本是 DEFLATE，就继续 DEFLATE。
+                    method = e.method if e.method in (0, 8) else 8
+                    blob = payload if method == 0 else deflate(payload)
+                    crc = zlib.crc32(payload) & 0xffffffff
                     lho = o.tell()
-                    write_local(o, e, 8, zlib.crc32(payload) & 0xffffffff, len(comp), len(payload), comp)
-                    new_cd.append((e, 8, zlib.crc32(payload) & 0xffffffff, len(comp), len(payload), lho))
+                    write_local(o, e, method, crc, len(blob), len(payload), blob)
+                    new_cd.append((e, method, crc, len(blob), len(payload), lho))
                     replaced += 1
                     if name == "classes.dex":
                         # 附加 dex 紧跟 classes.dex（即 classes12.dex 之后）写入
@@ -179,6 +191,16 @@ def main():
                             write_local(o, xe, 8, zlib.crc32(xdata) & 0xffffffff, len(comp2), len(xdata), comp2)
                             new_cd.append((xe, 8, zlib.crc32(xdata) & 0xffffffff, len(comp2), len(xdata), lho2))
                         extras = []
+                        # 新增条目（比如我们自己的 libmmread.so）：和原包的 .so 一样用 deflate
+                        for aname, adata in adds:
+                            ae = Entry(ver_made=e.ver_made, ver_need=e.ver_need, flags=0, method=0,
+                                       mtime=e.mtime, mdate=e.mdate, name=aname.encode("utf-8"),
+                                       extra=b"", comment=b"", iattr=0, eattr=e.eattr, lho=0)
+                            comp3 = deflate(adata)
+                            lho3 = o.tell()
+                            write_local(o, ae, 8, zlib.crc32(adata) & 0xffffffff, len(comp3), len(adata), comp3)
+                            new_cd.append((ae, 8, zlib.crc32(adata) & 0xffffffff, len(comp3), len(adata), lho3))
+                        adds = []
                 else:
                     n = local_record_len(mm, e)
                     lho = o.tell()

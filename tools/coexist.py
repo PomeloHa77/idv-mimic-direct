@@ -14,7 +14,16 @@
 刻意不改的：
   * 组件 android:name —— 那是**真实类名**（com.netease.dwrg.Launcher 等），
     清单里的名字是全限定类名，不需要跟包名前缀一致；
-  * resources.arsc —— 里面的 arsc 包名只是构建期标识，运行期资源定位靠 packageId(0x7f)。
+
+必须一起改的（真机实测踩过坑，见 README 2.5）：
+  * resources.arsc 里 ResTable_package 的**内联包名**。运行期
+    Resources.getIdentifier(name, type, getPackageName()) 是按「包名」在资源表里查的
+    （AssetManager.getResourceIdentifier 用 defPackage 去匹配 arsc 的 package 名）。
+    清单包名改了而 arsc 没改 → 查到 0 → 紧接着 getString(0) 抛
+    Resources$NotFoundException: String resource ID #0x0，现象就是点开游戏黑屏、
+    Launcher.onCreate 直接挂掉（logcat 里还有一行 "Invalid ID 0x00000000."）。
+    包名是定长字段（ResTable_package.name[128]），只覆盖写、不改任何长度，零副作用。
+    本包 arsc 的全局字符串池里没有任何含包名的字符串（实测 0 条），所以只需改这一处。
 
 包名怎么选：新包名取官方包的**超串**（com.netease.dwrg → com.netease.dwrg.fj）。
 这样所有「用自己的包名做子串匹配」的逻辑（实测 classes5.dex 里 Client$2.run 就是这么
@@ -23,6 +32,7 @@
 用法：
     python tools/coexist.py plan  <apk>                       # 只打印改动计划
     python tools/coexist.py patch <apk> <输出axml> [--plan 文件]
+    python tools/coexist.py patch-arsc <apk> <输出arsc>       # 改资源表里的包名
 """
 
 import argparse
@@ -277,6 +287,125 @@ def cmd_patch(args):
     return 0
 
 
+# ----------------------------------------------------------------- arsc 包名
+ARSC_TABLE_TYPE = 0x0002
+ARSC_PACKAGE_TYPE = 0x0200
+ARSC_PKG_NAME_FIELD = 256          # ResTable_package.name[128]，UTF-16LE，定长
+
+
+def find_arsc_package(data):
+    """返回 (包 chunk 偏移, 内联包名字符串)。"""
+    if len(data) < 12:
+        raise ValueError("resources.arsc 太小")
+    ctype, chdr, csize = struct.unpack_from("<HHI", data, 0)
+    if ctype != ARSC_TABLE_TYPE:
+        raise ValueError("不是 resources.arsc（首 chunk type=0x%04x）" % ctype)
+    off = chdr
+    while off + 8 <= len(data):
+        ctype, chdr, csize = struct.unpack_from("<HHI", data, off)
+        if ctype == ARSC_PACKAGE_TYPE:
+            if chdr < 12 + ARSC_PKG_NAME_FIELD:
+                raise ValueError("ResTable_package 头部长度异常")
+            raw = data[off + 12: off + 12 + ARSC_PKG_NAME_FIELD]
+            name = raw.decode("utf-16-le", "replace").split("\x00")[0]
+            return off, name
+        if csize <= 0:
+            break
+        off += csize
+    raise ValueError("没找到 ResTable_package chunk")
+
+
+def scan_arsc_strings(data, needle=OLD_PKG):
+    """扫全局字符串池里含 needle 的字符串（用于确认没有别处依赖包名）。"""
+    ctype, chdr, _csize = struct.unpack_from("<HHI", data, 0)
+    off = chdr
+    pool = None
+    while off + 8 <= len(data):
+        ctype, chdr, csize = struct.unpack_from("<HHI", data, off)
+        if ctype == 0x0001:
+            pool = (off, chdr, csize)
+            break
+        if csize <= 0:
+            break
+        off += csize
+    if not pool:
+        return []
+    po, phdr, _psize = pool
+    scount, style_count, flags, strings_start, _sstart = struct.unpack_from("<IIIII", data, po + 8)
+    utf8 = bool(flags & UTF8_FLAG)
+    offsets = struct.unpack_from("<%dI" % scount, data, po + phdr)
+    base = po + strings_start
+    out = []
+    for i, o in enumerate(offsets):
+        e = base + o
+        if utf8:
+            p = e
+            for _ in range(2):                      # 两段 uleb128
+                v = 0
+                s = 0
+                while True:
+                    b = data[p]
+                    p += 1
+                    v |= (b & 0x7F) << s
+                    if not (b & 0x80):
+                        break
+                    s += 7
+                if _ == 0:
+                    first = v
+                else:
+                    nbytes = v
+            txt = data[p:p + nbytes].decode("utf-8", "replace")
+        else:
+            n = struct.unpack_from("<H", data, e)[0]
+            txt = data[e + 2: e + 2 + n * 2].decode("utf-16-le", "replace")
+        if needle in txt or needle.replace(".", "/") in txt:
+            out.append((i, txt))
+    return out
+
+
+def patch_arsc(data, old_pkg=OLD_PKG, new_pkg=NEW_PKG, verbose=True):
+    """把 arsc 的包名改成 new_pkg，返回 (新字节, 旧名, 新名)。定长字段原地覆盖。"""
+    off, name = find_arsc_package(data)
+    if name != old_pkg:
+        raise ValueError("arsc 包名不是 %s（实际 %r）" % (old_pkg, name))
+    encoded = new_pkg.encode("utf-16-le") + b"\x00\x00"
+    if len(encoded) > ARSC_PKG_NAME_FIELD:
+        raise ValueError("新包名太长，装不进 ResTable_package.name[128]")
+    leftovers = scan_arsc_strings(data, old_pkg)
+    if leftovers and verbose:
+        print("  !! 字符串池里还有 %d 条含旧包名的字符串（需要人工确认）：" % len(leftovers))
+        for i, t in leftovers[:20]:
+            print("     #%-6d %r" % (i, t))
+    out = bytearray(data)
+    out[off + 12: off + 12 + ARSC_PKG_NAME_FIELD] = encoded + b"\x00" * (ARSC_PKG_NAME_FIELD - len(encoded))
+    # 校验：改完还能解析出正确包名，且文件长度没变（chunk 长度字段不用动）
+    check_off, check_name = find_arsc_package(bytes(out))
+    assert check_off == off and check_name == new_pkg, (check_off, check_name)
+    assert len(out) == len(data)
+    return bytes(out), name, new_pkg
+
+
+def cmd_plan_arsc(args):
+    with zipfile.ZipFile(args.apk) as z:
+        data = z.read("resources.arsc")
+    off, name = find_arsc_package(data)
+    print("== resources.arsc ==")
+    print("  ResTable_package 偏移 %d，当前包名 %r -> %r" % (off, name, NEW_PKG))
+    print("  字符串池中含旧包名的字符串：%d 条" % len(scan_arsc_strings(data)))
+    return 0
+
+
+def cmd_patch_arsc(args):
+    with zipfile.ZipFile(args.apk) as z:
+        data = z.read("resources.arsc")
+    new_data, old_name, new_name = patch_arsc(data)
+    with open(args.out, "wb") as f:
+        f.write(new_data)
+    print("resources.arsc 已改写：包名 %s -> %s，%d -> %d 字节" %
+          (old_name, new_name, len(data), len(new_data)))
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -287,6 +416,13 @@ def main():
     p2.add_argument("apk")
     p2.add_argument("out")
     p2.set_defaults(func=cmd_patch)
+    p3 = sub.add_parser("plan-arsc")
+    p3.add_argument("apk")
+    p3.set_defaults(func=cmd_plan_arsc)
+    p4 = sub.add_parser("patch-arsc")
+    p4.add_argument("apk")
+    p4.add_argument("out")
+    p4.set_defaults(func=cmd_patch_arsc)
     args = ap.parse_args()
     return args.func(args)
 
