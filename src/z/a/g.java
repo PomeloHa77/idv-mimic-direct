@@ -1,4 +1,4 @@
-package com.fj.direct;
+package z.a;
 
 import android.app.Activity;
 import android.app.Application;
@@ -9,8 +9,8 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
-import android.util.Log;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.Window;
 
 import java.lang.reflect.InvocationHandler;
@@ -21,7 +21,13 @@ import java.util.Map;
 import java.util.WeakHashMap;
 
 /**
- * 音量键开关悬浮窗：**音量减 = 隐藏，音量加 = 显示**。
+ * 音量键手势（原 com.fj.direct.KeyToggle）：悬浮窗不可触摸后，全部交互改由这里驱动。
+ *
+ * 手势表：
+ *   音量加 短按            = 扫描
+ *   音量加 按住 3.0 秒     = 复制结果到剪贴板
+ *   音量减 短按            = 显示 / 隐藏悬浮窗
+ *   音量减 按住 5.0 秒     = 解锁触摸 20 秒（可拖动面板、点按钮；再按住 5 秒立即上锁）
  *
  * 怎么在「不抢焦点、不改游戏代码」的前提下拿到音量键：
  *   按键在 app 内部先交给 Window.Callback（正常情况下就是 Activity 自己）的
@@ -32,14 +38,12 @@ import java.util.WeakHashMap;
  * 为什么不去把悬浮窗设成可获焦（FLAG_NOT_FOCUSABLE 去掉）：那样窗口会抢走输入焦点，
  * 手柄、物理键盘、输入法都可能被截到我们这儿来，游戏就没法正常操作了。
  *
- * 只有在**真起作用**时才吃掉按键（dispatchKeyEvent 返回 true）：
- *   悬浮窗本来就已经隐藏、还按音量减 → 不拦，正常调音量；
- *   悬浮窗本来就已经显示、还按音量加 → 不拦，正常调音量。
- * 这样音量控制只在「恰好要切换」的那一次被占用，其余时候还是系统的。
+ * 为什么音量键**全部吃掉**（含短按的音量减）：要区分「短按」和「按住 3/5 秒」，
+ * 就必须先把 DOWN 拦下来、自己计时；否则系统会先把音量调掉、界面还弹出来。
+ * 副作用是游戏内音量键被我们占用（调音量请用系统面板或游戏内设置），README 有记。
  */
-final class KeyToggle {
+final class g {
 
-    private static final String TAG = MemScanner.TAG;
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
 
@@ -71,7 +75,19 @@ final class KeyToggle {
     /** 上一次记录的已包 Window 数量（避免补捞日志刷屏）。 */
     private static int sLastWrapped;
 
-    private KeyToggle() {
+    /** 音量加长按 = 复制结果，判定阈值。 */
+    private static final long LONG_COPY_MS = 3000L;
+    /** 音量减长按 = 解锁/上锁触摸，判定阈值。 */
+    private static final long LONG_UNLOCK_MS = 5000L;
+
+    /** 音量加当前是否按住 / 是否已经触发过长按动作。 */
+    private static boolean sUpDown;
+    private static boolean sUpLong;
+    /** 音量减当前是否按住 / 是否已经触发过长按动作。 */
+    private static boolean sDownDown;
+    private static boolean sDownLong;
+
+    private g() {
     }
 
     /**
@@ -96,13 +112,13 @@ final class KeyToggle {
                     registerOn(real);
                 }
                 installVolumeObserver(app);
-                Log.i(TAG, "音量键开关已装上：音量减=隐藏悬浮窗，音量加=显示");
+                i.i("手势钩子已装上：音量加=扫描/长按复制，音量减=显示隐藏/长按解锁");
             }
             sweepExisting();
             MAIN.removeCallbacks(SWEEP);
             MAIN.postDelayed(SWEEP, SWEEP_INTERVAL);
         } catch (Throwable t) {
-            Log.e(TAG, "装音量键开关失败：" + t);
+            i.e("装音量键开关失败：" + t);
         }
     }
 
@@ -133,22 +149,22 @@ final class KeyToggle {
                                 }
                                 boolean down = v < sLastVolume;
                                 sLastVolume = v;
-                                Log.i(TAG, "音量变化（兜底通道）：" + (down ? "减小" : "增大") + " → " + v);
+                                i.i("音量变化（兜底通道）：" + (down ? "减小" : "增大") + " → " + v);
                                 if (down) {
-                                    if (OverlayWindow.isVisible()) {
-                                        OverlayWindow.hideAll();
+                                    if (f.isVisible()) {
+                                        f.hideAll();
                                     }
-                                } else if (!OverlayWindow.isVisible()) {
-                                    OverlayWindow.showAll();
+                                } else if (!f.isVisible()) {
+                                    f.showAll();
                                 }
                             } catch (Throwable t) {
-                                Log.w(TAG, "读音量失败：" + t);
+                                i.w("读音量失败：" + t);
                             }
                         }
                     });
-            Log.i(TAG, "音量变化兜底通道已装上（起始音量 " + sLastVolume + "）");
+            i.i("音量变化兜底通道已装上（起始音量 " + sLastVolume + "）");
         } catch (Throwable t) {
-            Log.w(TAG, "注册音量观察者失败：" + t);
+            i.w("注册音量观察者失败：" + t);
         }
     }
 
@@ -195,7 +211,7 @@ final class KeyToggle {
                 }
             });
         } catch (Throwable t) {
-            Log.w(TAG, "注册 Activity 生命周期回调失败：" + t);
+            i.w("注册 Activity 生命周期回调失败：" + t);
         }
     }
 
@@ -234,10 +250,10 @@ final class KeyToggle {
             int total = WRAPPED.size();
             if (n > 0 && total > sLastWrapped) {
                 sLastWrapped = total;
-                Log.i(TAG, "补捞到 " + total + " 个 Activity 的按键回调");
+                i.i("补捞到 " + total + " 个 Activity 的按键回调");
             }
         } catch (Throwable t) {
-            Log.w(TAG, "捞已有 Activity 失败：" + t);
+            i.w("捞已有 Activity 失败：" + t);
         }
     }
 
@@ -288,7 +304,7 @@ final class KeyToggle {
             }
             WRAPPED.put(w, cur);
             Window.Callback proxy = (Window.Callback) Proxy.newProxyInstance(
-                    KeyToggle.class.getClassLoader(),
+                    g.class.getClassLoader(),
                     new Class<?>[] { Window.Callback.class },
                     new InvocationHandler() {
                         @Override
@@ -297,13 +313,30 @@ final class KeyToggle {
                                     && args != null && args.length == 1
                                     && args[0] instanceof KeyEvent) {
                                 KeyEvent ke = (KeyEvent) args[0];
-                                if (ke.getAction() == KeyEvent.ACTION_DOWN) {
-                                    // 诊断行：能看出按键到底有没有送到 app（音量键被系统吃掉时这里不会有音量键）
-                                    Log.i(TAG, "收到按键 " + KeyEvent.keyCodeToString(ke.getKeyCode())
-                                            + " repeat=" + ke.getRepeatCount());
+                                if (ke.getAction() == KeyEvent.ACTION_DOWN
+                                        && ke.getRepeatCount() == 0
+                                        && (ke.getKeyCode() == KeyEvent.KEYCODE_VOLUME_UP
+                                            || ke.getKeyCode() == KeyEvent.KEYCODE_VOLUME_DOWN)) {
+                                    // 诊断行：能看出音量键到底有没有送到 app（被系统吃掉时这里不会有）
+                                    i.i("收到音量键 " + KeyEvent.keyCodeToString(ke.getKeyCode()));
                                 }
                                 if (handle(ke)) {
                                     return Boolean.TRUE;   // 已处理：不给游戏、也不调音量
+                                }
+                            }
+                            // 只在 Debug 构建里打：游戏侧「自己的」触摸事件有没有被系统打上
+                            // FLAG_WINDOW_IS_OBSCURED（bit0）。这是悬浮窗那条暴露面的现场取证：
+                            // 窗口设成 NOT_TOUCHABLE 后，这里必须永远是「被遮挡=false」。
+                            // release 构建里 i.ON 是编译期常量 false，整段被 javac 消掉。
+                            if (i.ON && "dispatchTouchEvent".equals(m.getName())
+                                    && args != null && args.length == 1
+                                    && args[0] instanceof MotionEvent) {
+                                MotionEvent me = (MotionEvent) args[0];
+                                if (me.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                                    int f = me.getFlags();
+                                    i.i("触摸 flags=0x" + Integer.toHexString(f)
+                                            + " 被遮挡=" + ((f & 0x1) != 0)
+                                            + " @" + (int) me.getRawX() + "," + (int) me.getRawY());
                                 }
                             }
                             try {
@@ -315,33 +348,100 @@ final class KeyToggle {
                         }
                     });
             w.setCallback(proxy);
-            Log.i(TAG, "已挂上按键回调：" + activity.getClass().getName());
+            i.i("已挂上按键回调：" + activity.getClass().getName());
         } catch (Throwable t) {
-            Log.w(TAG, "挂按键回调失败：" + t);
+            i.w("挂按键回调失败：" + t);
         }
     }
 
-    /** @return true 表示这次按键被我们吃掉（不要传给游戏、也不要调音量） */
+    /** 音量加按住 3 秒：复制结果。 */
+    private static final Runnable LONG_UP = new Runnable() {
+        @Override
+        public void run() {
+            if (!sUpDown) {
+                return;
+            }
+            sUpLong = true;
+            i.i("手势：音量加长按 → 复制");
+            f.copyText();
+        }
+    };
+
+    /** 音量减按住 5 秒：解锁触摸；已经解锁中的话立刻上锁。 */
+    private static final Runnable LONG_DOWN = new Runnable() {
+        @Override
+        public void run() {
+            if (!sDownDown) {
+                return;
+            }
+            sDownLong = true;
+            if (f.touchable()) {
+                i.i("手势：音量减长按 → 立即上锁");
+                f.lockTouch();
+            } else {
+                i.i("手势：音量减长按 → 解锁触摸");
+                f.unlockTouch();
+            }
+        }
+    };
+
+    /**
+     * 音量键状态机。
+     *
+     * @return true 表示这次按键被我们吃掉（不要传给游戏、也不要调音量）
+     */
     private static boolean handle(KeyEvent e) {
         int k = e.getKeyCode();
         if (k != KeyEvent.KEYCODE_VOLUME_DOWN && k != KeyEvent.KEYCODE_VOLUME_UP) {
             return false;
         }
-        // 只认「第一次按下」，长按连发不重复处理
-        if (e.getAction() != KeyEvent.ACTION_DOWN || e.getRepeatCount() != 0) {
-            return false;
-        }
-        if (k == KeyEvent.KEYCODE_VOLUME_DOWN) {
-            if (OverlayWindow.isVisible()) {
-                OverlayWindow.hideAll();
-                return true;
+        boolean up = k == KeyEvent.KEYCODE_VOLUME_UP;
+        int action = e.getAction();
+
+        if (action == KeyEvent.ACTION_DOWN) {
+            if (e.getRepeatCount() > 0) {
+                return true;    // 长按连发：吃掉，别让系统顺势连续调音量
             }
-            return false;   // 本来就隐藏着，音量减继续按原样调音量
-        }
-        if (!OverlayWindow.isVisible()) {
-            OverlayWindow.showAll();
+            if (up) {
+                sUpDown = true;
+                sUpLong = false;
+                MAIN.postDelayed(LONG_UP, LONG_COPY_MS);
+            } else {
+                sDownDown = true;
+                sDownLong = false;
+                MAIN.postDelayed(LONG_DOWN, LONG_UNLOCK_MS);
+            }
             return true;
         }
-        return false;       // 本来就显示着，音量加继续按原样调音量
+
+        if (action == KeyEvent.ACTION_UP) {
+            MAIN.removeCallbacks(up ? LONG_UP : LONG_DOWN);
+            boolean was;
+            boolean wasLong;
+            if (up) {
+                was = sUpDown;
+                wasLong = sUpLong;
+                sUpDown = false;
+                sUpLong = false;
+            } else {
+                was = sDownDown;
+                wasLong = sDownLong;
+                sDownDown = false;
+                sDownLong = false;
+            }
+            if (was && !wasLong) {
+                if (up) {
+                    i.i("手势：音量加短按 → 扫描");
+                    f.startScan();
+                } else {
+                    i.i("手势：音量减短按 → 显示/隐藏");
+                    f.toggle();
+                }
+            }
+            return true;
+        }
+
+        // ACTION_MULTIPLE 之类：音量键一律吃掉，避免漏给系统
+        return true;
     }
 }

@@ -1,4 +1,4 @@
-package com.fj.direct;
+package z.a;
 
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -12,7 +12,6 @@ import android.os.Looper;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.style.ForegroundColorSpan;
-import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -28,14 +27,24 @@ import java.io.FileOutputStream;
 import java.io.OutputStreamWriter;
 
 /**
- * 悬浮窗：手动点「扫描」按钮触发一次进程内扫描，结果按阵营上色显示。
+ * 悬浮窗（原 com.fj.direct.OverlayWindow）：结果按阵营上色常显，扫描由音量键触发。
+ *
+ * 关键设计：窗口**全程 FLAG_NOT_TOUCHABLE**（看得见、点不到）。
+ * 为什么必须这样：只要窗口可触摸，落在它矩形范围内的每一次点击，输入系统都会给
+ * 下层游戏的事件打上 FLAG_WINDOW_IS_OBSCURED（Android 12+ 若游戏窗口是
+ * BLOCK_UNTRUSTED，这种触摸甚至会被直接丢弃），这是典型的「有东西盖在上面」信号。
+ * 设为不可触摸后，窗口不参与命中测试，游戏侧永远看不到这个标记。
+ *
+ * 代价是不可触摸的窗口既点不到按钮也拖不动，所以交互全部改由音量键驱动（见 g）：
+ *   音量加 短按 = 扫描          音量加 按住 3.0s = 复制结果
+ *   音量减 短按 = 显示/隐藏     音量减 按住 5.0s = 解锁触摸 20s（可拖动/点按钮）
+ * 解锁窗口倒计时结束自动上锁，保证「对局中」这一常态下窗口始终不可触摸。
  *
  * 清单里自带 android.permission.SYSTEM_ALERT_WINDOW，所以只需要用户在系统设置里
- * 授权一次「显示在其他应用上层」；未授权时退化为 Toast + 写文件。
+ * 授权一次「显示在其他应用上层」；未授权时退化为 Toast。
  */
-public final class OverlayWindow {
+public final class f {
 
-    private static final String TAG = "FJDirect";
     private static final int CAMP_COLOR_DETECTIVE = 0xFF4FA8FF; // 侦探团
     private static final int CAMP_COLOR_WOLF = 0xFFFF5A5A;      // 狼人
     private static final int CAMP_COLOR_MYSTERY = 0xFFFFC93C;   // 神秘客
@@ -52,17 +61,26 @@ public final class OverlayWindow {
     private static View sPlaceholder;
     private static TextView sBody;
     private static Button sScanBtn;
+    private static TextView sTitle;
     private static WindowManager.LayoutParams sParams;
     private static volatile boolean sScanning;
     /** 已被音量减键摘下来（窗口不在 WindowManager 里）。 */
     private static volatile boolean sHidden;
     /** 面板被「✕」收成了小方块。 */
     private static volatile boolean sMinimized;
+    /** 当前窗口是否可触摸（默认 false = 不可触摸，只有解锁窗口内为 true）。 */
+    private static volatile boolean sTouchable;
+    /** 解锁窗口剩余秒数。 */
+    private static volatile int sUnlockLeft;
     private static int sAttempts;
     /** 「点」与「拖」的分界：位移超过这么多 px 就算拖动，不再当成点击。 */
     private static final int TAP_SLOP = 12;
+    /** 解锁后保持可触摸的秒数。 */
+    private static final int UNLOCK_SECONDS = 20;
+    /** 面板默认标题。 */
+    private static final String TITLE = "模仿者·直装";
 
-    private OverlayWindow() {
+    private f() {
     }
 
     public static void scheduleInstall(final Context ctx) {
@@ -86,23 +104,23 @@ public final class OverlayWindow {
         try {
             Context ctx = sCtx;
             if (ctx == null) {
-                Log.w(TAG, "context 为空，无法建悬浮窗");
+                i.w("context 为空，无法建悬浮窗");
                 return;
             }
             sWm = (WindowManager) ctx.getSystemService(Context.WINDOW_SERVICE);
             if (sWm == null) {
-                Log.w(TAG, "WindowManager 为空");
+                i.w("WindowManager 为空");
                 return;
             }
             sRoot = buildView(ctx);
             sParams = buildParams();
             sWm.addView(sRoot, sParams);
-            Log.i(TAG, "悬浮窗已创建（悬浮窗权限=" + (overlayAllowed(ctx) ? "已授权" : "未授权") + "）");
+            i.i("悬浮窗已创建（悬浮窗权限=" + (overlayAllowed(ctx) ? "已授权" : "未授权") + "）");
             // 未授权时 addView **不会抛异常**，窗口会进 WindowManager 但被策略隐藏
             // （mPolicyVisibility=false / mAppOpVisibility=false），屏幕上什么都看不到。
             // 所以光靠 try/catch 判断不出「装了但没显示」，必须显式查一下 app-op 并提示。
             if (!overlayAllowed(ctx)) {
-                Log.w(TAG, "SYSTEM_ALERT_WINDOW 未授权：窗口已加入但会被系统隐藏");
+                i.w("SYSTEM_ALERT_WINDOW 未授权：窗口已加入但会被系统隐藏");
                 toast("悬浮窗被系统拦住：请到「设置 → 应用 → 显示在其他应用上层」允许后重开游戏");
             }
             MAIN.postDelayed(new Runnable() {
@@ -110,7 +128,7 @@ public final class OverlayWindow {
                 public void run() {
                     try {
                         if (sRoot != null && !sHidden && !sRoot.isShown()) {
-                            Log.w(TAG, "窗口已加入但未显示（被系统策略隐藏），多半是没授权「显示在其他应用上层」");
+                            i.w("窗口已加入但未显示（被系统策略隐藏），多半是没授权「显示在其他应用上层」");
                             toast("悬浮窗没显示出来：请授权「显示在其他应用上层」后重开游戏");
                         }
                     } catch (Throwable ignore) {
@@ -120,7 +138,7 @@ public final class OverlayWindow {
             }, 3000L);
         } catch (Throwable t) {
             sRoot = null;
-            Log.e(TAG, "创建悬浮窗失败（可能未授予 SYSTEM_ALERT_WINDOW）：" + t);
+            i.e("创建悬浮窗失败（可能未授予 SYSTEM_ALERT_WINDOW）：" + t);
             if (sAttempts == 1) {
                 toast("请到「设置 → 应用 → 第五人格 → 显示在其他应用上层」授权后重开游戏");
             }
@@ -170,6 +188,9 @@ public final class OverlayWindow {
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        // 不可触摸是这套方案的核心：窗口不参与触摸命中测试，
+                        // 游戏侧的触摸事件就不会再带「被遮挡」标记。
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
         p.gravity = Gravity.TOP | Gravity.START;
@@ -200,13 +221,14 @@ public final class OverlayWindow {
         bar.setGravity(Gravity.CENTER_VERTICAL);
 
         TextView title = new TextView(ctx);
-        title.setText("模仿者·直装");
+        title.setText(TITLE);
         title.setTextColor(0xFFDDDDDD);
         title.setTextSize(12f);
         title.setPadding(0, 0, dp(ctx, 4), 0);
         title.setLayoutParams(new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         bar.addView(title);
+        sTitle = title;
 
         // 「✕」= 最小化成一枚小方块（不是杀进程，也撤不掉系统里的窗口，
         // 这样才不会出现「关掉之后再也叫不回来」的窘境）。
@@ -293,9 +315,9 @@ public final class OverlayWindow {
         sBody = new TextView(ctx);
         sBody.setTextColor(0xFFEEEEEE);
         sBody.setTextSize(13f);
-        sBody.setText("点「扫描」开始（进对局后再点）\n"
-                + "拖标题栏移动 ·「收起」只留按钮行 ·「✕」收成小方块\n"
-                + "音量减=隐藏悬浮窗，音量加=显示");
+        sBody.setText("音量加 短按=扫描 · 按住 3 秒=复制\n"
+                + "音量减 短按=显示/隐藏 · 按住 5 秒=解锁触摸 20 秒\n"
+                + "窗口默认不可触摸（点不到），解锁后可拖动/点按钮");
         sBody.setPadding(0, dp(ctx, 6), 0, 0);
         scroll.addView(sBody);
         sPanel.addView(scroll);
@@ -399,6 +421,105 @@ public final class OverlayWindow {
         return sRoot != null && !sHidden;
     }
 
+    /** 短按音量减：显示/隐藏切换。 */
+    static void toggle() {
+        if (isVisible()) {
+            hideAll();
+        } else {
+            showAll();
+        }
+    }
+
+    /** 当前窗口是否可触摸（解锁窗口内为 true）。 */
+    static boolean touchable() {
+        return sTouchable;
+    }
+
+    /**
+     * 切换窗口的可触摸性。
+     *
+     * 为什么要能切：不可触摸的窗口点不到也拖不动，用户偶尔需要拖动位置或点「复制」，
+     * 所以给一个「按住音量减 5 秒解锁、20 秒后自动上锁」的窗口 ——
+     * 对局中的常态永远是不可触摸（零遮挡标记），只有用户主动解锁的那段时间才可触摸。
+     */
+    private static void setTouchable(final boolean on) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            MAIN.post(new Runnable() {
+                @Override
+                public void run() {
+                    setTouchable(on);
+                }
+            });
+            return;
+        }
+        if (sRoot == null || sParams == null) {
+            return;
+        }
+        try {
+            int flags = sParams.flags;
+            if (on) {
+                flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+            } else {
+                flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+            }
+            if (flags == sParams.flags) {
+                return;
+            }
+            sParams.flags = flags;
+            sWm.updateViewLayout(sRoot, sParams);
+            sTouchable = on;
+            i.i(on ? "窗口已解锁触摸" : "窗口已上锁（不可触摸）");
+        } catch (Throwable t) {
+            i.w("切换触摸性失败：" + t);
+        }
+    }
+
+    /** 解锁触摸 UNLOCK_SECONDS 秒，期间标题显示倒计时，到点自动上锁。 */
+    static void unlockTouch() {
+        MAIN.removeCallbacks(TICK);
+        setTouchable(true);
+        sUnlockLeft = UNLOCK_SECONDS;
+        setTitleText("已解锁 " + sUnlockLeft + "s");
+        MAIN.postDelayed(TICK, 1000L);
+    }
+
+    /** 立即上锁。 */
+    static void lockTouch() {
+        MAIN.removeCallbacks(TICK);
+        sUnlockLeft = 0;
+        setTouchable(false);
+        setTitleText(TITLE);
+    }
+
+    /** 解锁倒计时；只在主线程跑。 */
+    private static final Runnable TICK = new Runnable() {
+        @Override
+        public void run() {
+            sUnlockLeft--;
+            if (sUnlockLeft <= 0) {
+                lockTouch();
+                return;
+            }
+            setTitleText("已解锁 " + sUnlockLeft + "s");
+            MAIN.postDelayed(this, 1000L);
+        }
+    };
+
+    private static void setTitleText(final String s) {
+        MAIN.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    if (sTitle != null) {
+                        sTitle.setText(s);
+                    }
+                } catch (Throwable ignore) {
+                    // ignore
+                }
+            }
+        });
+    }
+
     /**
      * 完全隐藏：把面板和小方块都藏起来，只留一个 1×1 的透明占位视图。
      *
@@ -428,9 +549,9 @@ public final class OverlayWindow {
             sChip.setVisibility(View.GONE);
             sPlaceholder.setVisibility(View.VISIBLE);
             sHidden = true;
-            Log.i(TAG, "悬浮窗已隐藏（按音量加恢复）");
+            i.i("悬浮窗已隐藏（按音量加恢复）");
         } catch (Throwable t) {
-            Log.e(TAG, "隐藏悬浮窗失败", t);
+            i.e("隐藏悬浮窗失败", t);
         }
     }
 
@@ -456,9 +577,9 @@ public final class OverlayWindow {
                 sPanel.setVisibility(View.VISIBLE);
             }
             sHidden = false;
-            Log.i(TAG, "悬浮窗已显示（按音量减隐藏）");
+            i.i("悬浮窗已显示（按音量减隐藏）");
         } catch (Throwable t) {
-            Log.e(TAG, "显示悬浮窗失败", t);
+            i.e("显示悬浮窗失败", t);
         }
     }
 
@@ -468,9 +589,9 @@ public final class OverlayWindow {
             sMinimized = true;
             sPanel.setVisibility(View.GONE);
             sChip.setVisibility(View.VISIBLE);
-            Log.i(TAG, "悬浮窗已最小化：点「FJ」小方块可恢复");
+            i.i("悬浮窗已最小化：点「FJ」小方块可恢复");
         } catch (Throwable t) {
-            Log.e(TAG, "最小化失败", t);
+            i.e("最小化失败", t);
         }
     }
 
@@ -480,47 +601,61 @@ public final class OverlayWindow {
             sMinimized = false;
             sChip.setVisibility(View.GONE);
             sPanel.setVisibility(View.VISIBLE);
-            Log.i(TAG, "悬浮窗已从小方块恢复");
+            i.i("悬浮窗已从小方块恢复");
         } catch (Throwable t) {
-            Log.e(TAG, "恢复悬浮窗失败", t);
+            i.e("恢复悬浮窗失败", t);
         }
     }
 
-    private static void startScan() {
+    /** 扫描入口（音量加短按 / 面板按钮都走这里）。 */
+    static void startScan() {
         if (sScanning) {
             return;
         }
         sScanning = true;
-        sScanBtn.setEnabled(false);
-        sBody.setText("扫描中…");
-        Log.i(TAG, "用户触发扫描");
+        MAIN.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    sScanBtn.setEnabled(false);
+                    sBody.setText("扫描中…");
+                } catch (Throwable ignore) {
+                    // ignore
+                }
+            }
+        });
+        i.i("触发扫描");
         Thread t = new Thread(new Runnable() {
             @Override
             public void run() {
-                MemScanner.Result r;
+                c.Result r;
                 try {
-                    r = MemScanner.scanOnce();
+                    r = c.scanOnce();
                 } catch (Throwable e) {
-                    r = new MemScanner.Result();
+                    r = new c.Result();
                     r.error = "扫描崩溃：" + e;
-                    Log.e(TAG, r.error, e);
+                    i.e(r.error, e);
                 }
                 showResult(r);
                 sScanning = false;
                 MAIN.post(new Runnable() {
                     @Override
                     public void run() {
-                        sScanBtn.setEnabled(true);
+                        try {
+                            sScanBtn.setEnabled(true);
+                        } catch (Throwable ignore) {
+                            // ignore
+                        }
                     }
                 });
             }
-        }, "FJDirect-scan");
+        });
         t.setDaemon(true);
         t.start();
     }
 
-    private static void showResult(final MemScanner.Result r) {
-        final String[] lines = MemScanner.toLines(r);
+    private static void showResult(final c.Result r) {
+        final String[] lines = c.toLines(r);
         StringBuilder sb = new StringBuilder();
         for (String s : lines) {
             sb.append(s).append('\n');
@@ -546,7 +681,7 @@ public final class OverlayWindow {
             sb.append("错误：").append(r.error).append('\n');
         }
         final String plain = sb.toString();
-        Log.i(TAG, "扫描结果：\n" + plain);
+        i.i("扫描结果：\n" + plain);
         writeToFile(plain);
         MAIN.post(new Runnable() {
             @Override
@@ -554,22 +689,22 @@ public final class OverlayWindow {
                 try {
                     sBody.setText(buildSpanned(r, plain));
                 } catch (Throwable t) {
-                    Log.e(TAG, "渲染结果失败", t);
+                    i.e("渲染结果失败", t);
                 }
                 toast("扫描完成：" + r.count + "/12（" + r.millis + " ms）");
             }
         });
     }
 
-    private static CharSequence buildSpanned(MemScanner.Result r, String plain) {
+    private static CharSequence buildSpanned(c.Result r, String plain) {
         SpannableStringBuilder sb = new SpannableStringBuilder(plain);
         int pos = 0;
         for (int i = 0; i < 12; i++) {
             if (!r.found[i]) {
                 continue;
             }
-            String line = "编号" + (i + 1) + " : " + RoleTable.campName(r.camp[i]) + "丨"
-                    + RoleTable.nameOf(r.role[i]);
+            String line = "编号" + (i + 1) + " : " + e.campName(r.camp[i]) + "丨"
+                    + e.nameOf(r.role[i]);
             int start = plain.indexOf(line, pos);
             if (start < 0) {
                 continue;
@@ -589,33 +724,43 @@ public final class OverlayWindow {
         return sb;
     }
 
-    private static void copyText() {
+    /** 复制结果到剪贴板（音量加长按 / 面板按钮）。 */
+    static void copyText() {
         try {
             CharSequence txt = sBody.getText();
             ClipboardManager cm = (ClipboardManager) sCtx.getSystemService(Context.CLIPBOARD_SERVICE);
             if (cm != null) {
-                cm.setPrimaryClip(ClipData.newPlainText("FJDirect", txt));
+                cm.setPrimaryClip(ClipData.newPlainText("s", txt));
                 toast("已复制");
             }
         } catch (Throwable t) {
-            Log.e(TAG, "复制失败", t);
+            i.e("复制失败", t);
         }
     }
 
+    /**
+     * 把结果落盘。
+     *
+     * 只在 debug 构建里调用（见 showResult）：release 版本一行日志、一个文件都不落，
+     * 免 root 的进程内读取本身不产生任何可被游戏侧观察到的痕迹。
+     */
     private static void writeToFile(String text) {
+        if (!i.ON) {
+            return;
+        }
         try {
             File dir = sCtx.getExternalFilesDir(null);
             if (dir == null) {
                 return;
             }
-            File f = new File(dir, "scan.txt");
+            File f = new File(dir, "log.txt");
             FileOutputStream fos = new FileOutputStream(f, false);
             OutputStreamWriter w = new OutputStreamWriter(fos, "UTF-8");
             w.write(text);
             w.close();
-            Log.i(TAG, "结果已写入 " + f.getAbsolutePath());
+            i.i("结果已写入 " + f.getAbsolutePath());
         } catch (Throwable t) {
-            Log.e(TAG, "写文件失败", t);
+            i.e("写文件失败", t);
         }
     }
 
