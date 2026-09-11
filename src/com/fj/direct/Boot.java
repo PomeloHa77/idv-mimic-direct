@@ -1,5 +1,6 @@
 package com.fj.direct;
 
+import android.app.Application;
 import android.content.Context;
 import android.util.Log;
 
@@ -53,6 +54,7 @@ public final class Boot {
             }
             sBooted = true;
             Log.i(TAG, "Boot.boot 注入成功，context=" + (sCtx != null));
+            installKeyToggle(sCtx);
             OverlayWindow.scheduleInstall(sCtx);
         } catch (Throwable t) {
             Log.e(TAG, "Boot.boot 失败", t);
@@ -74,10 +76,29 @@ public final class Boot {
             }
             Log.i(TAG, "Boot.ensure context=" + (sCtx != null));
             if (sCtx != null) {
+                installKeyToggle(sCtx);
                 OverlayWindow.scheduleInstall(sCtx);
             }
         } catch (Throwable t) {
             Log.e(TAG, "Boot.ensure 失败", t);
+        }
+    }
+
+    /** 音量键开关要挂 Activity 生命周期回调，所以必须拿到 Application。 */
+    private static void installKeyToggle(Context ctx) {
+        try {
+            if (ctx instanceof Application) {
+                KeyToggle.install((Application) ctx);
+                return;
+            }
+            Context app = resolveApplication();
+            if (app instanceof Application) {
+                KeyToggle.install((Application) app);
+            } else {
+                Log.w(TAG, "拿不到 Application：音量键开关未装（悬浮窗的按钮不受影响）");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "装音量键开关失败：" + t);
         }
     }
 

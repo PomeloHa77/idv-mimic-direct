@@ -386,6 +386,46 @@ return me == null || pkg == null || me.equals(pkg);
 判定之后 `dumpsys window windows` 里属于本 app、`appop=SYSTEM_ALERT_WINDOW` 的窗口**始终只有 1 个**，
 且它的 `mSession` 指向主进程 pid。
 
+### 4.6 悬浮窗的收起方式与音量键开关（真机逐个验过）
+
+| 操作 | 效果 | 窗口尺寸（dumpsys 实测） |
+|---|---|---|
+| 拖标题栏 | 移动位置 | — |
+| 「收起」 | 只留标题行 + 按钮行，结果区收起 | 688×968 → 688×308 |
+| 「✕」 | 收成一枚 `FJ` 小方块（点它恢复） | 688×968 → 76×89 |
+| 音量减 | 完全隐藏，屏幕上零痕迹 | → 1×1 |
+| 音量加 | 恢复 | 1×1 → 688×968 |
+
+音量键怎么拿到的：进程内用动态代理把 Activity 的 `Window.Callback` 包一层，
+只截 `dispatchKeyEvent` 里的音量键、其余调用原样转发 —— 不用把悬浮窗设成可获焦
+（那样会抢走手柄/键盘/输入法的焦点）。**只有真切换时才吃掉按键**：本来就隐藏着按音量减、
+本来就显示着按音量加，都不拦，音量照常调。
+
+实现上踩过的坑（别再踩）：
+
+1. **生命周期回调在这个包里不生效**：manifest 里的 `UFProxyApplication` 只是网易
+   unifix 热更新的代理，`registerActivityLifecycleCallbacks` 注册成功、日志也打了，
+   但 `onActivityResumed` **一次都不回调**（真机实测），于是拿不到 Activity 去挂按键。
+   现在除了注册，还每隔 2 s 反射扫一遍 `ActivityThread.mActivities` 补挂没挂过的 Activity
+   （靠 `WeakHashMap` 去重，不会重复包）。
+2. **隐藏不能让窗口尺寸归零、也不能把窗口摘掉**（两种都试过，都会卡死）：
+   * `removeViewImmediate` + `addView` → 卡在 `mDrawState=READY_TO_SHOW`、
+     `Surface shown=false`、`alpha=0`，屏幕上看不见也回不来；
+   * 直接 `setVisibility(GONE)` → 尺寸算成 0×0，系统随即把 `mPolicyVisibility` 置 false，
+     再恢复 `VISIBLE` 也回不来（`mEnterAnimationPending=true` 卡住）。
+
+   现在用一个 **1×1 透明占位视图**把窗口撑住，只藏面板和小方块：窗口可见性状态机不动，
+   隐藏/恢复都是瞬间完成。
+3. **未授权 `SYSTEM_ALERT_WINDOW` 时 `addView` 不抛异常**：窗口会正常进 WindowManager，
+   只是被策略隐藏（`mAppOpVisibility=false` / `mPolicyVisibility=false`），表现是
+   「不崩、屏幕上什么都没有」。所以启动时用
+   `AppOpsManager.checkOpNoThrow("android:system_alert_window", uid, pkg)` 主动查一次，
+   没授权就 Toast 提示。**MIUI 上覆盖安装会把这个权限重置成 `ignore`，每次重装后都要重新授权**
+   （命令：`su -c "appops set com.netease.dwrg.fj SYSTEM_ALERT_WINDOW allow"`）。
+4. **「收起 / ✕」曾经根本点不到**：面板宽度是由 ScrollView 的固定宽度决定的，
+   让按钮行用 WRAP_CONTENT 去挤会被压成 0 宽、裁到窗口外面。现在面板宽度显式定 250dp，
+   标题行（标题 + ✕）与按钮行（扫描 / 复制 / 收起，三等分）分两行排。
+
 ## 5. 扫描器细节（与 root 版行为对齐）
 
 特征码、字段偏移、守卫**完全沿用** root 版 `模仿者遍历.cpp`：
@@ -534,6 +574,8 @@ adb install -r "out\第五人格-直装版-2026.0828.1653.apk"
 | 与官方共存 | 设备上的官方包是 **4399 渠道版 `com.netease.dwrg.m4399`**，与 `com.netease.dwrg.fj` 互不影响，两个客户端都在 |
 | 启动 | 正常进到游戏（登录界面 + 维护公告），**黑屏已消失** |
 | 悬浮窗 | `FJDirect: 悬浮窗已创建`，屏幕上左上角显示「模仿者·直装 / 扫描 / 复制」 |
+| 悬浮窗控制 | 「收起」688×968→688×308；「✕」→76×89（点小方块恢复）；音量减→1×1、音量加→688×968（`dumpsys window windows` 实测尺寸） |
+| 音量键开关 | `收到按键 KEYCODE_VOLUME_DOWN` → `悬浮窗已隐藏`；`KEYCODE_VOLUME_UP` → `悬浮窗已显示`（按键被吃掉时不改音量） |
 | 悬浮窗归属 | 属于本 app 的 `SYSTEM_ALERT_WINDOW` 窗口**只有 1 个**，`mSession` = 主进程 pid；`:PushService` 进程不再建窗（见 4.5 节） |
 | 扫描（不在对局） | `耗时 2384 ms｜通道 process_vm_readv｜区域 457｜读取 1244 MB｜命中 0/12`（整轮扫完、没触发上限；不在对局所以没有命中，符合预期） |
 | 扫描（游戏加载中） | `耗时 6877 ms｜通道 process_vm_readv｜区域 1293｜读取 3475 MB｜命中 0/12`（同上，未触发 8 GB 上限） |
