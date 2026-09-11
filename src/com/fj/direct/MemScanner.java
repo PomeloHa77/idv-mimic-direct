@@ -33,7 +33,12 @@ public final class MemScanner {
     /** 特征码最大偏移（i+23 与 identity 的 i+0x1B 都在 32 字节内）。 */
     private static final int LOOKAHEAD = 32;
     /** 扫描字节上限，避免极端情况下长时间占用（默认 3 GB）。 */
-    private static final long BYTE_BUDGET = 3L << 30;
+    /**
+     * 单次扫描的读取上限。真机实测：Redmi K20 Pro（Android 13）上 rw 匿名区域共 1182 个，
+     * 读满 3 GB 只用 7 s（process_vm_readv 通道），3 GB 会在扫完之前就被截断，
+     * 有可能把真正存角色的区域漏在后面，所以放宽到 8 GB。
+     */
+    private static final long BYTE_BUDGET = 8L << 30;
 
     public static final class Result {
         public final boolean[] found = new boolean[12];
@@ -45,6 +50,8 @@ public final class MemScanner {
         public int hitPages;
         public long millis;
         public boolean memOk;
+        /** 实际用的读内存通道：process_vm_readv 或 /proc/self/mem */
+        public String reader = "";
         public String error;
     }
 
@@ -58,16 +65,26 @@ public final class MemScanner {
         r.regions = regs.size();
         Log.i(TAG, "扫描开始：rw 匿名区域 " + regs.size() + " 个");
 
-        RandomAccessFile mem;
-        try {
-            mem = new RandomAccessFile("/proc/self/mem", "r");
+        // 优先 native（process_vm_readv 自读，Android 10+ 也能用），
+        // 退回 /proc/self/mem（Android 9 及以下可用，10+ 会被 SELinux 拒）。
+        RandomAccessFile mem = null;
+        boolean useNative = MemReader.nativeOk();
+        if (useNative) {
             r.memOk = true;
-        } catch (Throwable t) {
-            r.memOk = false;
-            r.error = "打开 /proc/self/mem 失败：" + t;
-            r.millis = System.currentTimeMillis() - t0;
-            Log.e(TAG, r.error);
-            return r;
+            r.reader = "process_vm_readv";
+        } else {
+            try {
+                mem = new RandomAccessFile("/proc/self/mem", "r");
+                r.memOk = true;
+                r.reader = "/proc/self/mem";
+            } catch (Throwable t) {
+                r.memOk = false;
+                r.error = "打开 /proc/self/mem 失败，且 native 通道不可用（"
+                        + MemReader.nativeErr() + "）：" + t;
+                r.millis = System.currentTimeMillis() - t0;
+                Log.e(TAG, r.error);
+                return r;
+            }
         }
 
         byte[] buf = new byte[CHUNK + LOOKAHEAD];
@@ -89,8 +106,15 @@ public final class MemScanner {
                     }
                     int n;
                     try {
-                        mem.seek(addr);
-                        n = mem.read(buf, 0, want);
+                        if (useNative) {
+                            n = MemReader.readSelf(addr, buf, 0, want);
+                            if (n < 0) {
+                                n = 0;          // -errno：该段不可读，按页跳过
+                            }
+                        } else {
+                            mem.seek(addr);
+                            n = mem.read(buf, 0, want);
+                        }
                     } catch (Throwable t) {
                         n = -1;
                     }
@@ -118,15 +142,17 @@ public final class MemScanner {
             r.error = "扫描异常：" + t;
             Log.e(TAG, r.error, t);
         } finally {
-            try {
-                mem.close();
-            } catch (Throwable ignore) {
-                // ignore
+            if (mem != null) {
+                try {
+                    mem.close();
+                } catch (Throwable ignore) {
+                    // ignore
+                }
             }
         }
 
         r.millis = System.currentTimeMillis() - t0;
-        Log.i(TAG, "扫描结束：命中编号 " + r.count + " 个，读取 " + r.bytes
+        Log.i(TAG, "扫描结束：" + r.reader + " 通道，命中编号 " + r.count + " 个，读取 " + r.bytes
                 + " 字节，耗时 " + r.millis + " ms");
         return r;
     }

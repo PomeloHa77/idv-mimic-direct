@@ -270,8 +270,9 @@ public final class OverlayWindow {
             sb.append("未命中任何角色\n");
         }
         sb.append("---\n");
-        sb.append("耗时 ").append(r.millis).append(" ms")
-                .append(" | 区域 ").append(r.regions)
+            sb.append("耗时 ").append(r.millis).append(" ms")
+                    .append(" | 通道 ").append(r.reader)
+                    .append(" | 区域 ").append(r.regions)
                 .append(" | 读取 ").append(r.bytes / 1048576).append(" MB")
                 .append(" | 命中 ").append(r.count).append("/12\n");
         if (r.error != null) {
