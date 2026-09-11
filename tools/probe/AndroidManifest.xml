@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  遮挡探针（dev-only，不随发布包分发）。
+  只做一件事：证明「悬浮窗设成 FLAG_NOT_TOUCHABLE 后，下层窗口（游戏）收到的触摸
+  事件不再带 FLAG_WINDOW_IS_OBSCURED」。见 tools/build_probe.ps1。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.fj.probe"
+    android:versionCode="1"
+    android:versionName="1.0">
+
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="30" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <application android:label="probe" android:debuggable="true">
+        <activity android:name="com.fj.probe.M" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

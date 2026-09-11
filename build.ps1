@@ -1,4 +1,4 @@
-﻿<#
+<#
   第五人格「模仿者看身份」直装版 —— 一键构建流水线
 
   为什么这么建：官方包 1.88 GB，绝大多数体积是资源（.wpk/.npk，很多是 STORED）。
@@ -17,7 +17,11 @@ param(
     [switch]$SkipDecompile,
     [switch]$V2Only,
     # 共存版：把包名改成 com.netease.dwrg.fj，可与官方包同时安装（默认）
-    [switch]$OriginalPackage
+    [switch]$OriginalPackage,
+    # 排错构建：打开日志（logcat 输出 / 结果落盘）。默认 release 全静默。
+    [switch]$DebugBuild,
+    # 额外产出「遮挡探针」apk（dev-only，用来实证 NOT_TOUCHABLE 的效果）
+    [switch]$Probe
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,7 +68,7 @@ $Dexdump   = Find-Tool 'dexdump'   @(Join-Path $BuildTools 'dexdump.exe')
 $AndroidJar = 'E:\Android\Sdk\platforms\android-35\android.jar'
 if (-not (Test-Path $AndroidJar)) { throw "找不到 android.jar：$AndroidJar" }
 
-# NDK：只用来编译我们自己的 libmmread.so（process_vm_readv 进程内自读，
+# NDK：只用来编译我们自己的 libnrt.so（process_vm_readv 进程内自读，
 # 因为 Android 10+ 的 SELinux 不让 app 打开 /proc/self/mem）
 $Ndk = $env:ANDROID_NDK_HOME
 if (-not $Ndk -or -not (Test-Path $Ndk)) {
@@ -73,7 +77,7 @@ if (-not $Ndk -or -not (Test-Path $Ndk)) {
         Sort-Object Name -Descending | Select-Object -First 1
     if ($cand) { $Ndk = $cand.FullName }
 }
-if (-not $Ndk) { throw "找不到 NDK（编译 libmmread.so 需要）；设 ANDROID_NDK_HOME 或放到 E:\Dev\tool\NDK" }
+if (-not $Ndk) { throw "找不到 NDK（编译 libnrt.so 需要）；设 ANDROID_NDK_HOME 或放到 E:\Dev\tool\NDK" }
 $NdkBin    = Join-Path $Ndk 'toolchains\llvm\prebuilt\windows-x86_64\bin'
 $NdkClang  = Join-Path $NdkBin 'aarch64-linux-android21-clang.cmd'
 $NdkNm     = Join-Path $NdkBin 'llvm-nm.exe'
@@ -180,12 +184,50 @@ if ($LASTEXITCODE -ne 0) { throw 'smali 回编译失败' }
 Ok ((Get-Item $PatchedDex).Length.ToString() + ' B')
 
 # ------------------------------------------------- 5/6. 编译我们自己的 dex
-Step 5 'javac 编译 src/com/fj/direct（--release 8）'
+Step 5 '字符串密文化（tools/obf_strings.py）'
+# 为什么在源码层做：dex 的 string_data_item 是 uleb128 长度 + MUTF-8，原址改字节
+# 既改不了长度、又容易写出非法 MUTF-8；改源码则一切由 javac/d8 保证合法，
+# 而且 src/ 保持可读 —— 密文化后的副本只落在 work/obf-src。
+$ObfSrc   = Join-Path $Work 'obf-src'
+$ObfMap   = Join-Path $Work 'obf-strings.txt'
+$ObfTest  = Join-Path $Work 'obf-test'
+foreach ($d in @($ObfSrc, $ObfTest)) {
+    if (Test-Path $d) { Remove-Item -LiteralPath $d -Recurse -Force }
+}
+& $Python -X utf8 (Join-Path $Root 'tools\obf_strings.py') (Join-Path $Root 'src') $ObfSrc `
+    --map $ObfMap --test-src $ObfTest
+if ($LASTEXITCODE -ne 0) { throw 'obf_strings.py 失败' }
+
+# release 全静默：把日志门面的开关钉成 false；-DebugBuild 才打开
+$LgSrc = Join-Path $ObfSrc 'z\a\i.java'
+$lgText = [System.IO.File]::ReadAllText($LgSrc)
+$lgNew = if ($DebugBuild) { 'public static final boolean ON = true;' }
+         else { 'public static final boolean ON = false;' }
+$lgText2 = $lgText -replace 'public static final boolean ON = (true|false);', $lgNew
+if ($lgText2 -eq $lgText -and -not $DebugBuild) { Ok '日志开关已是 false' }
+[System.IO.File]::WriteAllText($LgSrc, $lgText2, (New-Object System.Text.UTF8Encoding($false)))
+$lgState = 'false（release 静默）'
+if ($DebugBuild) { $lgState = 'true（Debug 构建，会打日志/写文件）' }
+Ok ("日志开关 ON=" + $lgState)
+
+Step '5b' 'javac 编译 work/obf-src（--release 8）'
 $JavaClasses = Join-Path $Work 'java-classes'
-$JavaSrc = Get-ChildItem (Join-Path $Root 'src') -Recurse -Filter *.java | ForEach-Object { $_.FullName }
+if (Test-Path $JavaClasses) { Remove-Item -LiteralPath $JavaClasses -Recurse -Force }
+$JavaSrc = Get-ChildItem $ObfSrc -Recurse -Filter *.java | ForEach-Object { $_.FullName }
 & $Javac -encoding UTF-8 --release 8 -nowarn -cp $AndroidJar -d $JavaClasses $JavaSrc
 if ($LASTEXITCODE -ne 0) { throw 'javac 失败' }
 Ok "$($JavaSrc.Count) 个源文件"
+
+Step '5c' '解码自检（JVM 上把每处密文解回来与原文逐条比对）'
+# 这一步证明「Python 编码面」与「Java 解码面」100% 对称：任何一处漏改/错改都会在这里炸。
+$TestClasses = Join-Path $Work 'obf-test-classes'
+if (Test-Path $TestClasses) { Remove-Item -LiteralPath $TestClasses -Recurse -Force }
+$TestSrc = Join-Path $ObfTest 'z\a\T.java'
+& $Javac -encoding UTF-8 --release 8 -nowarn -cp $JavaClasses -d $TestClasses $TestSrc
+if ($LASTEXITCODE -ne 0) { throw '自检类编译失败' }
+& $Java -cp "$JavaClasses;$TestClasses" z.a.T
+if ($LASTEXITCODE -ne 0) { throw '字符串编解码自检失败' }
+Ok 'decode-check OK'
 
 Step 6 'd8 -> classes13.dex'
 $DexOut = Join-Path $Work 'dexout'
@@ -196,17 +238,32 @@ $ExtraDex = Join-Path $DexOut 'classes.dex'
 Ok ((Get-Item $ExtraDex).Length.ToString() + ' B -> classes13.dex')
 
 # ------------------------------------------------------------- 7. 重打包
-Step '6b' 'NDK 编译 libmmread.so（process_vm_readv 进程内自读，免 root）'
+Step '6b' 'NDK 编译 libnrt.so（process_vm_readv 进程内自读，免 root）'
+# 与上一版的三点区别（都是为了不留下可被静态识别的特征）：
+#   1) 文件名换成中性短名 libnrt.so，且不与原包任何 lib 重名；
+#   2) 不再导出 Java_包名_类名_方法名（那个符号名本身即自曝），改用
+#      JNI_OnLoad + RegisterNatives 动态绑定，动态符号表只剩 JNI_OnLoad；
+#   3) -fvisibility=hidden + -Wl,-s，静态符号表也一并去掉。
 $NativeDir = Join-Path $Work 'native'
 if (-not (Test-Path $NativeDir)) { New-Item -ItemType Directory -Path $NativeDir -Force | Out-Null }
-$MmReadSo = Join-Path $NativeDir 'libmmread.so'
-& $NdkClang -shared -fPIC -O2 -s -Wall -o $MmReadSo (Join-Path $Root 'src\native\mmread.c')
-if ($LASTEXITCODE -ne 0) { throw 'libmmread.so 编译失败' }
+$LibName  = 'libnrt.so'
+$MmReadSo = Join-Path $NativeDir $LibName
+& $NdkClang -shared -fPIC -O2 -fvisibility=hidden '-Wl,--exclude-libs,ALL' '-Wl,-s' -Wall `
+    -o $MmReadSo (Join-Path $Root 'src\native\nrt.c')
+if ($LASTEXITCODE -ne 0) { throw "$LibName 编译失败" }
 Ok ((Get-Item $MmReadSo).Length.ToString() + ' B')
+
+$dynSyms = & $NdkNm --dynamic --defined-only $MmReadSo
+$dynNames = $dynSyms | ForEach-Object { ($_ -split '\s+')[-1] } | Where-Object { $_ }
+$badSyms = $dynNames | Where-Object { $_ -ne 'JNI_OnLoad' }
+if ($badSyms) { throw ("$LibName 多出导出符号：" + ($badSyms -join ', ')) }
+Ok ("导出符号只有 " + ($dynNames -join ', '))
+& $Python -X utf8 (Join-Path $Root 'tools\check_stealth.py') so $MmReadSo
+if ($LASTEXITCODE -ne 0) { throw "$LibName 字符串检查失败" }
 
 Step 7 '重打包（保序保压缩方式，丢弃旧 v1 签名）'
 $Unsigned = Join-Path $Work 'app-unsigned.apk'
-$addArgs = @('--add', "lib/arm64-v8a/libmmread.so=$MmReadSo")
+$addArgs = @('--add', "lib/arm64-v8a/$LibName=$MmReadSo")
 & $Python -X utf8 (Join-Path $Root 'tools\repack.py') $SrcApk $Unsigned `
     --classes-dex $PatchedDex --extra-dex "classes13.dex=$ExtraDex" --drop-v1-signature @replaceArgs @addArgs
 if ($LASTEXITCODE -ne 0) { throw 'repack 失败' }
@@ -325,20 +382,30 @@ print('    resources.arsc 包名 = %s（STORED, %d B）OK' % (name, len(arsc)))
 "@ $Final $arscWant
 if ($LASTEXITCODE -ne 0) { throw 'resources.arsc 包名校验失败' }
 
-Write-Host '  -- libmmread.so 校验 --'
-$sym = & $NdkNm --dynamic --defined-only $MmReadSo | Select-String 'Java_com_fj_direct_MemReader_readSelf'
-if (-not $sym) { throw 'libmmread.so 没有导出 Java_com_fj_direct_MemReader_readSelf' }
-Write-Host ("  导出符号 OK：" + $sym.Line.Trim())
+Write-Host '  -- libnrt.so 校验（ELF + 包内条目）--'
 & $Python -X utf8 -c @"
 import sys, zipfile
+entry = 'lib/arm64-v8a/' + sys.argv[2]
 with zipfile.ZipFile(sys.argv[1]) as z:
-    i = z.getinfo('lib/arm64-v8a/libmmread.so')
-    d = z.read('lib/arm64-v8a/libmmread.so')
+    i = z.getinfo(entry)
+    d = z.read(entry)
 assert d[:4] == b'\x7fELF', d[:4]
 assert d[18:20] == b'\xb7\x00', d[18:20]   # e_machine = EM_AARCH64(183)
-print('    lib/arm64-v8a/libmmread.so OK：%d B（包内 %d B，method=%d）' % (len(d), i.compress_size, i.compress_type))
-"@ $Final
-if ($LASTEXITCODE -ne 0) { throw 'libmmread.so 校验失败' }
+print('    %s OK：%d B（包内 %d B，method=%d）' % (entry, len(d), i.compress_size, i.compress_type))
+"@ $Final $LibName
+if ($LASTEXITCODE -ne 0) { throw 'libnrt.so 校验失败' }
+
+Write-Host '  -- 隐身化硬断言 --'
+# 1) classes13.dex 里不许有任何品牌/玩法明文（字面量全部已密文化）
+& $Python -X utf8 (Join-Path $Root 'tools\check_stealth.py') dex $extraCheck
+if ($LASTEXITCODE -ne 0) { throw 'classes13.dex 明文特征检查失败' }
+# 2) 我们的 9 个类名不许和官方 12 个 dex 里的任何内容撞车（撞了会 NoClassDefFoundError）
+& $Python -X utf8 (Join-Path $Root 'tools\check_stealth.py') collide $SrcApk `
+    'Lz/a/a;' 'Lz/a/b;' 'Lz/a/c;' 'Lz/a/d;' 'Lz/a/e;' 'Lz/a/f;' 'Lz/a/g;' 'Lz/a/h;' 'Lz/a/i;'
+if ($LASTEXITCODE -ne 0) { throw '类名冲突检查失败' }
+# 3) 新增的 so 条目不许和原包已有的 lib 重名（覆盖别人的库会直接崩）
+& $Python -X utf8 (Join-Path $Root 'tools\check_stealth.py') libname $SrcApk "lib/arm64-v8a/$LibName"
+if ($LASTEXITCODE -ne 0) { throw 'lib 重名检查失败' }
 
 Write-Host "`n构建完成：$Final" -ForegroundColor Green
 if ($OriginalPackage) {
@@ -348,4 +415,14 @@ if ($OriginalPackage) {
 } else {
     Write-Host "安装（共存版，可与官方包同时安装，无需卸载任何东西）：" -ForegroundColor Green
     Write-Host "  adb install -r `"$Final`"" -ForegroundColor Green
+}
+if ($DebugBuild) {
+    Write-Host "  （这是 -DebugBuild 构建：会打 logcat / 写结果文件，别拿它当发布包）" -ForegroundColor Yellow
+}
+
+# --------------------------------------------------------------- 11. 遮挡探针
+if ($Probe) {
+    Step 11 '构建遮挡探针 apk（dev-only）'
+    & pwsh -NoProfile -File (Join-Path $Root 'tools\build_probe.ps1')
+    if ($LASTEXITCODE -ne 0) { throw '遮挡探针构建失败' }
 }
