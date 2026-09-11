@@ -64,6 +64,21 @@ $Dexdump   = Find-Tool 'dexdump'   @(Join-Path $BuildTools 'dexdump.exe')
 $AndroidJar = 'E:\Android\Sdk\platforms\android-35\android.jar'
 if (-not (Test-Path $AndroidJar)) { throw "找不到 android.jar：$AndroidJar" }
 
+# NDK：只用来编译我们自己的 libmmread.so（process_vm_readv 进程内自读，
+# 因为 Android 10+ 的 SELinux 不让 app 打开 /proc/self/mem）
+$Ndk = $env:ANDROID_NDK_HOME
+if (-not $Ndk -or -not (Test-Path $Ndk)) {
+    $cand = Get-ChildItem 'E:\Dev\tool\NDK' -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path (Join-Path $_.FullName 'toolchains\llvm\prebuilt') } |
+        Sort-Object Name -Descending | Select-Object -First 1
+    if ($cand) { $Ndk = $cand.FullName }
+}
+if (-not $Ndk) { throw "找不到 NDK（编译 libmmread.so 需要）；设 ANDROID_NDK_HOME 或放到 E:\Dev\tool\NDK" }
+$NdkBin    = Join-Path $Ndk 'toolchains\llvm\prebuilt\windows-x86_64\bin'
+$NdkClang  = Join-Path $NdkBin 'aarch64-linux-android21-clang.cmd'
+$NdkNm     = Join-Path $NdkBin 'llvm-nm.exe'
+if (-not (Test-Path $NdkClang)) { throw "找不到 NDK clang：$NdkClang" }
+
 $Python = 'py'
 
 $ApktoolJar = Join-Path $Root 'libs\apktool_2.9.3.jar'
@@ -142,6 +157,19 @@ if (-not $OriginalPackage) {
     $replaceArgs += '--replace'
     $replaceArgs += "AndroidManifest.xml=$ManifestPatch"
     Ok $ManifestPatch
+
+    # resources.arsc 必须一起改：运行期 Resources.getIdentifier(name, type, getPackageName())
+    # 是按**包名**在资源表里查的（AssetManager 用 defPackage 匹配 arsc 的 package 名）。
+    # 清单包名改了而 arsc 没改 → 查到 0 → 紧接着 getString(0) 抛
+    # Resources$NotFoundException，真机表现就是点开游戏黑屏、Launcher.onCreate 直接挂掉。
+    # 包名是定长字段（ResTable_package.name[128]），原地覆盖，长度不变、零副作用。
+    Step '3c' '改写 resources.arsc 的包名（定长字段原地覆盖）'
+    $ArscPatch = Join-Path $Work 'resources.patched.arsc'
+    & $Python -X utf8 (Join-Path $Root 'tools\coexist.py') patch-arsc $SrcApk $ArscPatch
+    if ($LASTEXITCODE -ne 0) { throw 'coexist.py patch-arsc 失败' }
+    $replaceArgs += '--replace'
+    $replaceArgs += "resources.arsc=$ArscPatch"
+    Ok $ArscPatch
 }
 
 # --------------------------------------------------------- 4. 回编译 classes.dex
@@ -168,10 +196,19 @@ $ExtraDex = Join-Path $DexOut 'classes.dex'
 Ok ((Get-Item $ExtraDex).Length.ToString() + ' B -> classes13.dex')
 
 # ------------------------------------------------------------- 7. 重打包
+Step '6b' 'NDK 编译 libmmread.so（process_vm_readv 进程内自读，免 root）'
+$NativeDir = Join-Path $Work 'native'
+if (-not (Test-Path $NativeDir)) { New-Item -ItemType Directory -Path $NativeDir -Force | Out-Null }
+$MmReadSo = Join-Path $NativeDir 'libmmread.so'
+& $NdkClang -shared -fPIC -O2 -s -Wall -o $MmReadSo (Join-Path $Root 'src\native\mmread.c')
+if ($LASTEXITCODE -ne 0) { throw 'libmmread.so 编译失败' }
+Ok ((Get-Item $MmReadSo).Length.ToString() + ' B')
+
 Step 7 '重打包（保序保压缩方式，丢弃旧 v1 签名）'
 $Unsigned = Join-Path $Work 'app-unsigned.apk'
+$addArgs = @('--add', "lib/arm64-v8a/libmmread.so=$MmReadSo")
 & $Python -X utf8 (Join-Path $Root 'tools\repack.py') $SrcApk $Unsigned `
-    --classes-dex $PatchedDex --extra-dex "classes13.dex=$ExtraDex" --drop-v1-signature @replaceArgs
+    --classes-dex $PatchedDex --extra-dex "classes13.dex=$ExtraDex" --drop-v1-signature @replaceArgs @addArgs
 if ($LASTEXITCODE -ne 0) { throw 'repack 失败' }
 
 # ------------------------------------------------------------- 8. zipalign
@@ -271,6 +308,37 @@ with zipfile.ZipFile(apk) as z:
 "@ $Final $extraCheck
 if ($LASTEXITCODE -ne 0) { throw 'classes13.dex 校验失败' }
 & $Dexdump -f $extraCheck | Select-String 'Opened|header' | Select-Object -First 3
+
+Write-Host '  -- resources.arsc 包名校验 --'
+$arscWant = if ($OriginalPackage) { 'com.netease.dwrg' } else { 'com.netease.dwrg.fj' }
+& $Python -X utf8 -c @"
+import sys, zipfile
+sys.path.insert(0, r'$Root\tools')
+import coexist
+with zipfile.ZipFile(sys.argv[1]) as z:
+    arsc = z.read('resources.arsc')
+info = zipfile.ZipFile(sys.argv[1]).getinfo('resources.arsc')
+off, name = coexist.find_arsc_package(arsc)
+assert name == sys.argv[2], 'arsc 包名 %r != %r' % (name, sys.argv[2])
+assert info.compress_type == 0, 'resources.arsc 必须 STORED，实际 method=%d' % info.compress_type
+print('    resources.arsc 包名 = %s（STORED, %d B）OK' % (name, len(arsc)))
+"@ $Final $arscWant
+if ($LASTEXITCODE -ne 0) { throw 'resources.arsc 包名校验失败' }
+
+Write-Host '  -- libmmread.so 校验 --'
+$sym = & $NdkNm --dynamic --defined-only $MmReadSo | Select-String 'Java_com_fj_direct_MemReader_readSelf'
+if (-not $sym) { throw 'libmmread.so 没有导出 Java_com_fj_direct_MemReader_readSelf' }
+Write-Host ("  导出符号 OK：" + $sym.Line.Trim())
+& $Python -X utf8 -c @"
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    i = z.getinfo('lib/arm64-v8a/libmmread.so')
+    d = z.read('lib/arm64-v8a/libmmread.so')
+assert d[:4] == b'\x7fELF', d[:4]
+assert d[18:20] == b'\xb7\x00', d[18:20]   # e_machine = EM_AARCH64(183)
+print('    lib/arm64-v8a/libmmread.so OK：%d B（包内 %d B，method=%d）' % (len(d), i.compress_size, i.compress_type))
+"@ $Final
+if ($LASTEXITCODE -ne 0) { throw 'libmmread.so 校验失败' }
 
 Write-Host "`n构建完成：$Final" -ForegroundColor Green
 if ($OriginalPackage) {
