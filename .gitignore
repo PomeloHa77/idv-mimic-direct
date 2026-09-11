@@ -22,6 +22,9 @@ __pycache__/
 *.pyc
 *.class
 
+# apksigner 的 v4 签名产物（out/ 已被忽略，这里再兜一层）
+*.idsig
+
 # 编辑器
 .idea/
 .vscode/

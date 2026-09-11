@@ -1,671 +1,481 @@
-# 第五人格「模仿者看身份」免 root 直装版 / 共存版（注入式）
+# 第五人格「模仿者看身份」共存版（注入式）—— 免 root + 隐身化改造
 
-把原本需要 root 的内存扫描器**直接注入游戏进程**，让扫描器跑在游戏自己的地址空间里，
-用 `/proc/self/maps` 取区域、用 `process_vm_readv` 读自己的内存
-（Android 10+ 上 `/proc/self/mem` 被 SELinux 拒，细节见 4.4 节）。因此：
+把原本需要 root 的内存扫描器**直接注入游戏进程**：扫描器跑在游戏自己的地址空间里，
+用 `/proc/self/maps` 取区域、用 `process_vm_readv(getpid(), …)` 读自己的内存。
 
-* **不需要 root**，不需要 `process_vm_readv`、不需要 `/proc/pid/pagemap`；
-* **不新增、不修改任何 `.so`** —— 反外挂会核对 `assets/ntunisdk_so_uuids` 与
-  `assets/probeSoMd5Record.txt`，纯 Java 实现天然绕开这一层；
-* **不新增任何权限** —— 官方包**本来就声明了** `android.permission.SYSTEM_ALERT_WINDOW`，
-  悬浮窗直接可用；
-* **只改必要的字符串** —— 直装版只动 `classes.dex`；共存版额外改 33 条清单字符串
-  与 2 条 dex 字符串（见第 2 节），组件、权限、`resources.arsc`、`.so` 全都不动。
+一句话原理：**别人读你的内存要 root，你自己读自己的内存不用** ——
+内核 `process_vm_rw() → mm_access() → ptrace_may_access() → __ptrace_may_access()`
+的第一句就是 `if (same_thread_group(task, current)) return 0;`，
+「读自己」在 LSM 检查之前就放行了（见 `src/native/nrt.c`）。
 
-一句话原理：**别人读你的内存要 root，你自己读自己的内存不用。**
+本轮（2026-09-11）在上一版基础上做了**隐身化改造**：把能被静态扫描或运行期日志
+识别的暴露面全部消除或压低，剩下的都是原理上无法消除的（见第 9 节）。
 
-两个产物：**共存版**（默认，包名 `com.netease.dwrg.fj`，可与官方客户端同时安装、同时登录）
-和**直装版**（`-OriginalPackage`，包名与官方一致，需先卸载官方包）。见第 1 节。
+---
+
+## 0. 三个不变量（任何时候都不许破）
+
+1. **不动任何既有 `.so`**（`libsec-lib.so` / `libenvsdk.so` / `libsecsdk.so` /
+   `libybuaxx.so` …），**不动 `assets/`**（尤其 `ntunisdk_so_uuids`、
+   `probeSoMd5Record.txt`、`emulatordetector_data`），不动 `resources.arsc` 的资源内容；
+2. **不新增任何权限**：`android.permission.SYSTEM_ALERT_WINDOW` 官方包本来就声明了；
+3. **只改 `classes.dex`**（2 处注入 + 12 处签名回填 + 9 处 `SigningInfo`；共存版再加 2 条
+   包名字符串），共存版另改清单 33 条字符串与 `resources.arsc` 的包名定长字段。
 
 ---
 
 ## 1. 产物
 
-两个模式，产物互不冲突：
-
 | 项 | 共存版（默认） | 直装版（`-OriginalPackage`） |
 |---|---|---|
 | 文件 | `out/第五人格-共存版-2026.0828.1653.apk` | `out/第五人格-直装版-2026.0828.1653.apk` |
-| 大小 | 2 012 868 396 B | 2 012 868 324 B |
-| SHA-256 | `a0875e325f78c7c64e14ec93febbc458343c3f647476dfe009cffe4714072720` | `fb3cb387911084dd3319e3b4721c398c0a509503bb430c415b080f765fc42844` |
+| 大小 | 2 012 880 681 B | 同流程产出，清单不延长故略小 |
+| SHA-256 | `c7a977960fa9d79d0afe284ec5d5ee1b53a4d5c5c75737143680ea1b7e5c375d` | 见构建输出 |
 | 包名 | **`com.netease.dwrg.fj`** | `com.netease.dwrg`（与官方一致） |
 | 与官方包共存 | 可以，可同时安装、同时登录 | 不行，必须先卸载官方包 |
-| 安装命令 | `adb install -r "out\第五人格-共存版-2026.0828.1653.apk"` | `adb uninstall com.netease.dwrg` 后再 `adb install -r "out\第五人格-直装版-2026.0828.1653.apk"` |
 
-两版共同点：
+两版共同点：`versionCode/versionName = 262401653 / 2026.0828.1653`（与官方一致）、
+`minSdk 21 / targetSdk 30`、仅 `arm64-v8a`、**v1 + v2 签名**（自签 `CN=fjdirect`，v3 关闭）、
+zip 条目 6075（原包 6073，多 `classes13.dex` 与 `lib/arm64-v8a/libnrt.so`）。
 
-| 项 | 值 |
-|---|---|
-| versionCode / versionName | `262401653` / `2026.0828.1653`（与官方一致） |
-| minSdk / targetSdk | 21 / 30 |
-| ABI | `arm64-v8a`（官方包就只有这一套） |
-| 签名 | v1 + v2（自签名 `CN=fjdirect`，与原包同样的方案组合，v3 关闭） |
-| zip 条目数 | 共存版 6075（原包 6073） |
-
-> 为什么两个都留着：**共存版**能在同一台机器上和官方客户端并排跑（对照、双开，
-> 官方包继续用于支付/客服等场景）；**直装版**包名与官方完全相同，任何按 package name
-> 硬编码的第三方回调（渠道统计、微信/QQ 分享回包里的 `package` 字段）都不会有偏差，
-> 代价是必须先卸载官方包。
->
-> 共存版**不需要**卸载任何东西，官方包与新包的本地数据也互不干扰
-> （各自 `/data/data/<包名>` 与 `/sdcard/Android/data/<包名>`）。
+```powershell
+pwsh -File build.ps1                  # 共存版（推荐：官方包原样留着，可对照/双开）
+pwsh -File build.ps1 -OriginalPackage # 直装版（包名与官方一致，需先卸载官方包）
+```
 
 ---
 
-## 2. 共存版：为什么改包名、改了什么、为什么只改这些
+## 2. 隐身化改造（为什么改、改完怎么证明真的改了）
 
-### 2.1 为什么必须改包名
+### 2.1 暴露面清单 → 处置 → 实证
 
-Android 用 **package name 唯一标识一个应用**：同包名的第二个 APK 会被当成「同一个应用」，
-走升级/替换逻辑，签名不同就直接 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。
-所以「共存」没有别的办法，只能换包名。
+| # | 原来的暴露面 | 谁看得见 | 处置 | 验证方式 |
+|---|---|---|---|---|
+| 1 | dex 明文特征：`模仿者`/`第五人格`/`FJDirect`/`com/fj/direct`/`scan.txt`/`狼人`/`侦探团`/`神秘客`/`阵营`/角色名 | 任何把它拖进 jadx 的人 | **中性短类名 + 全部字符串字面量密文化**（2.2 节） | 构建期 `check_stealth dex` 硬断言；剩余可打印串 354 条，全是类名/字段名等结构性内容 |
+| 2 | logcat 自曝：`I FJDirect: 悬浮窗已创建 …` | 同一个进程 `logcat -d` 就能读到 | **日志门面 `z.a.i`**，release 下 `ON` 是编译期常量 `false`，`javac` 把整块日志消掉（2.6 节） | 真机 release 跑完启动 + 扫描，logcat **0 行**相关输出 |
+| 3 | 结果落盘 `files/scan.txt`（文本、中文、带包名目录） | 任何文件管理器 / 备份 / 云同步 | release **不落盘**；只有 `-DebugBuild` 才写，且改名 `log.txt` | 真机 `ls /sdcard/Android/data/com.netease.dwrg.fj/files/` 无该文件 |
+| 4 | 悬浮窗「被遮挡」标记：窗口可触摸 → 下层游戏窗口的触摸事件带 `FLAG_WINDOW_IS_OBSCURED`（Android 12+ 若游戏窗口是 `BLOCK_UNTRUSTED`，触摸甚至被直接丢弃） | 游戏进程自己（`MotionEvent.getFlags()`） | **窗口全程 `FLAG_NOT_FOCUSABLE \| FLAG_NOT_TOUCHABLE`**：看得见、点不到、不参与命中测试（2.4 节） | `dumpsys input` 里我们的窗口 `inputConfig=NOT_FOCUSABLE \| NOT_TOUCHABLE`、游戏窗口 `inputConfig=0x0`；探针实测游戏侧 `flags=0x100000`（无 bit0） |
+| 5 | JNI 符号自曝：`Java_com_fj_direct_MemReader_readSelf` 把包名/类名/方法名直接写进 `.so` | `nm` / `strings libmmread.so` | **`JNI_OnLoad` + `RegisterNatives` 动态绑定**，动态符号表只剩 `JNI_OnLoad`（2.3 节） | 构建期 `llvm-nm --dynamic --defined-only` 断言：多余符号直接让构建失败 |
+| 6 | 库名 `libmmread.so` | `unzip -l` / `/proc/self/maps` | 改名 **`libnrt.so`**，且与原包 74 个 `lib/` 条目零重名 | 构建期 `check_stealth libname` 断言 |
+| 7 | 新类名与官方 dex 里的类 / 字符串撞车（会 `NoClassDefFoundError`） | —— | 用官方 **12 个 dex 全字节**校验 | 构建期 `check_stealth collide` 断言：0 冲突 |
 
-但换包名会连带一串必须一起换的东西 —— 凡是参与**系统级唯一性**或**进程自识别**的
-字符串都要跟着改，否则轻则装不上、重则运行期行为错乱：
+> 一句话：**静态看不出「这是什么工具」，运行期不留下「这个进程多做了什么事」的痕迹。**
+> 做不到的部分（自签证书、包名、dex 字节差异）在第 9 节逐条列清。
 
-| 对象 | 不改的后果 |
-|---|---|
-| `<manifest package>` | 等于什么都没改 |
-| `provider android:authorities` | `INSTALL_FAILED_CONFLICTING_PROVIDER`（authorities 全系统唯一） |
-| 自定义 `<permission android:name>` | `INSTALL_FAILED_DUPLICATE_PERMISSION`（同名 permission 的定义可能不同） |
-| `Manifest$permission.*` 常量 | 运行期用错 permission 名，动态注册的 receiver 收不到广播 |
-| 进程名自匹配字符串 | 进程内统计/上报逻辑认不出自己 |
+### 2.2 dex：中性命名 + 字符串密文化
 
-### 2.2 新包名为什么取 `com.netease.dwrg.fj`（超串）
+**类名映射**（`src/z/a/`，文件名 = 类名；冲突已用官方 12 个 dex 全字节验证为 0）：
 
-`classes5.dex` 的 `Client$2.run` 会执行 `top` 命令解析自身进程行，用
-`contains("com.netease.dwrg")` 判断「哪一行是我」，据此上报 CPU/RSS。
+| 类 | 原类名 | 职责 | 对外接口 |
+|---|---|---|---|
+| `z.a.a` | `Boot` | 注入入口：存 Context、判主进程、投递悬浮窗 + 按键钩子 | `public static void a(Context)`、`public static void b()` |
+| `z.a.b` | `SigFix` | 返回官方 `Signature[]`（DER 硬编码 base64） | `public static Signature[] a()` |
+| `z.a.c` | `MemScanner` | 进程内扫描器 | 包内 |
+| `z.a.d` | `MemReader` | 读内存统一入口（native 优先、文件兜底） | 包内 |
+| `z.a.e` | `RoleTable` | 角色索引 → 中文名（72 条） | 包内 |
+| `z.a.f` | `OverlayWindow` | 悬浮窗（上色、倒计时、复制） | 包内 |
+| `z.a.g` | `KeyToggle` | 音量键手势状态机 | 包内 |
+| `z.a.h` | —— | 字符串解密 | `public static String a(byte[])` |
+| `z.a.i` | —— | 日志门面（release 全静默） | 包内 |
 
-* 取**超串** `com.netease.dwrg.fj` → 该 `contains` **依旧命中**，`classes5.dex` 一行都不用改；
-* 若取 `com.fj.dwrg` 之类 → 必须再动 `classes5.dex`，多一个改动面、多一份风险。
+> 必须 `public` 的只有 `z.a.a` / `z.a.b` 及其被 smali 调用的方法：smali 是**跨包调用**，
+> 包私有会直接 `IllegalAccessError`。
 
-改得越少 = 越不容易崩，所以选超串。
+**字符串密文化**（`tools/obf_strings.py`）：
 
-### 2.3 清单：33 条改写 / 20 条保留
+```
+编码（Python 侧）  c[i] = p[i] ^ K[(i * 5 + 7) & 15]
+解码（Java 侧）    src/z/a/h.java 的 a(byte[])，与上式逐字节对称
+密钥 K             唯一真源是 h.java 里的 16 字节数组，脚本解析它，两边不一致构建直接失败
+本次结果           9 个文件、248 处字面量全部密文化（0 处跳过）
+```
 
-`python tools\coexist.py plan <原包>` 可复现下面这张表：
+* 产物只落在 `work/obf-src/`，`src/` 保持可读 —— 改源码由 `javac/d8` 保证 dex 合法，
+  比在 dex 里原地改 `string_data_item`（uleb128 长度 + MUTF-8，连长度都改不了）安全得多；
+* 构建期自检：把每一处密文在 **JVM 上解回来**与原文逐条比对，`decode-check 248/248 OK`
+  才算通过（`build.ps1` Step 5c）—— 证明「Python 编码面」与「Java 解码面」100% 对称；
+* 已知边界：`case "字面量":` 这类必须保持编译期常量的位置一律跳过并打印清单
+  （本仓库源码里没有，所以是 0 跳过；将来出现也不会静默出错）。
+
+### 2.3 native：`libnrt.so`（改名 + 去 `Java_` 导出）
+
+`src/native/nrt.c`：
+
+* 不导出 `Java_<包名>_<类名>_<方法名>`（那个符号名本身就把「哪个包、哪个类、哪个方法在读内存」
+  写进了 `.so`），改成 `JNI_OnLoad` 里 `RegisterNatives` 绑定 `z/a/d` 的 `(J[BII)I`；
+* 绑定用的类名字节数组做 XOR 掩码，**掩码变量必须是 `volatile`**：不加时 clang 会把 `xor`
+  直接折叠成明文常量塞进 `.rodata`，`strings` 照样能看到 `z/a/`（实测踩过）；
+* 编译参数：`-fvisibility=hidden '-Wl,--exclude-libs,ALL' '-Wl,-s'`，
+  动态符号表只剩 `JNI_OnLoad`（构建期 `llvm-nm` 硬断言），静态符号表也去掉；
+* 用 `syscall(__NR_process_vm_readv, …)` 而不是链接 libc 同名函数：bionic 从 API 23 才导出该符号，
+  而 minSdk 21；
+* 规模：`work/native/libnrt.so` 4 904 B，包内 1 881 B（DEFLATE）。
+
+### 2.4 悬浮窗：全程 `NOT_TOUCHABLE`
+
+窗口 flag 常驻 `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCHABLE | FLAG_LAYOUT_NO_LIMITS`：
+**看得见、点不到** —— 窗口不参与输入命中测试，游戏侧永远收不到被遮挡标记。
+代价是不可触摸的窗口既点不到按钮也拖不动，所以交互全部改由音量键驱动（2.5 节），
+只有「临时解锁」的 20 秒里才能拖动 / 点按钮。
+
+**遮挡实证**（两级）：
+
+1. 静态：`dumpsys input` 里我们的窗口
+   `inputConfig=NOT_FOCUSABLE | NOT_TOUCHABLE | PREVENT_SPLITTING`，
+   游戏 `com.netease.dwrg.Client` 窗口 `inputConfig=0x0`；
+2. 运行期：`tools/probe/`（dev-only 探针 APK，包名 `com.fj.probe`）自己盖一个可切换
+   「可触摸 / 不可触摸」的悬浮窗，把收到的 `MotionEvent.getFlags()` 打在屏幕和 logcat 上。
+   实测：`NOT_TOUCHABLE` 时下层 Activity 收到 `flags=0x100000`
+   （**bit0 `FLAG_WINDOW_IS_OBSCURED` 为 0**）；切成可触摸后，同坐标点击下层 Activity
+   **收不到事件**（说明窗口确实参与了命中测试，对照组成立）。
+
+```powershell
+pwsh -File build.ps1 -Probe     # 顺带产出 out/probe-overlay.apk（dev-only，别装到别人机器上）
+```
+
+### 2.5 交互：音量键手势（短按 / 长按）
+
+窗口不可触摸后，唯一的操作入口就是音量键。`z.a.g` 用 **DOWN/UP 计时**自实现长短按
+（不用 `getRepeatCount`：不同 ROM 的连发行为不一致）：
+
+| 键 | 短按 | 长按 |
+|---|---|---|
+| 音量 **加** | 扫描（结果直接显示在面板上；不在对局时会显示 `命中 0/12`） | 按住 **3.0 s** → 复制结果到剪贴板（Toast「已复制」） |
+| 音量 **减** | 显示 / 隐藏悬浮窗 | 按住 **5.0 s** → 解锁触摸 **20 s**（可拖动面板、点按钮；到时自动上锁，再按住 5 s 立即上锁） |
+
+* 音量键事件**全部吞掉**（否则无法区分「短按」和「按住 3 / 5 秒」）。
+  **副作用：游戏内音量键被占用，调音量请用系统面板或游戏内设置。**
+* 解锁期间标题变成「已解锁 Ns」倒计时，一眼能看出当前是可触摸状态。
+* 怎么拿到按键又不抢焦点：用 `Proxy` 把 Activity 的 `Window.Callback` 包一层，只截
+  `dispatchKeyEvent` 里的音量键、**其余调用原样转发**给原 callback（游戏自己的按键行为
+  一个字节都不变）。没有把悬浮窗设成可获焦（那样会抢走手柄/键盘/输入法的焦点）。
+* 为什么还要反射补捞 Activity：这个包用网易 unifix 热更新代理，manifest 里的
+  `UFProxyApplication` 只是代理，`registerActivityLifecycleCallbacks` 真机实测
+  **一次都不回调** → 除注册外，每 2 s 反射扫一遍 `ActivityThread.mActivities` 补挂
+  （`WeakHashMap` 去重，不会重复包）。
+* 兜底通道：`Settings.System` 音量值 + `ContentObserver`（不需权限），只在
+  「按键钩子没装上」时起作用，映射仍是显示 / 隐藏。
+
+### 2.6 静默：release 不打日志、不落盘
+
+* `z.a.i` 是唯一日志出口，`ON` 是 `public static final boolean`，`build.ps1` 按构建模式
+  把它钉成 `false`（默认 release）或 `true`（`-DebugBuild`）。release 下
+  `if (ON) { Log.x(…) }` 整块被 `javac` 消掉 —— dex 里没有日志调用，logcat 一行不写，
+  连 tag（`nt`）和中文文案本身也是密文；
+* 结果文件只在 `ON == true` 时写，文件名是 `log.txt`（不再是 `scan.txt`）；
+* **排错一定要用 `-DebugBuild` 构建**（装机会覆盖，装完记得重新授权悬浮窗）。
+
+```powershell
+pwsh -File build.ps1 -DebugBuild      # 打开日志（logcat + log.txt）
+pwsh -File build.ps1                  # 发布构建：全静默
+```
+
+> 参数名是 `-DebugBuild` 而不是 `-Debug`：PowerShell 的通用参数里已经有 `-Debug`，
+> 用它会直接报 `MetadataError`。
+
+---
+
+## 3. 共存版：为什么改包名、改了什么、为什么只改这些
+
+Android 用 **package name 唯一标识一个应用**：同包名的第二个 APK 会被当成「同一个应用」走
+升级 / 替换逻辑，签名不同就直接 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`。所以「共存」只能换包名。
+
+### 3.1 新包名为什么取 `com.netease.dwrg.fj`（超串）
+
+`classes5.dex` 的 `Client$2.run` 会执行 `top` 解析自身进程行、用
+`contains("com.netease.dwrg")` 判断「哪一行是我」并上报 CPU/RSS。取**超串**
+`com.netease.dwrg.fj` → 该 `contains` 依旧命中，`classes5.dex` 一行都不用改。改得越少越不容易崩。
+
+### 3.2 清单 33 条改写 / 20 条保留
 
 | 项 | 条数 | 例子 |
 |---|---|---|
 | `<manifest package>` | 1 | `com.netease.dwrg` → `com.netease.dwrg.fj` |
-| provider `android:authorities` | 28 条唯一串（共 31 处属性） | `com.netease.dwrg.fileprovider` → `com.netease.dwrg.fj.fileprovider` |
-| 自定义 `<permission>` | 2 条唯一串（共 3 处声明） | `com.netease.dwrg.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`、`com.netease.dwrg.permission.ngpush` |
+| provider `android:authorities` | 28 条唯一串（31 处属性） | `com.netease.dwrg.fileprovider` → `…fj.fileprovider` |
+| 自定义 `<permission>` | 2 条唯一串（3 处声明） | `…DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`、`…permission.ngpush` |
 | 组件 `android:name`（判定为非类名） | 1 | `com.netease.dwrg.yxapi.YXEntryActivity` |
 | 渠道回调标识 | 1 | `comccbpay105330173990048com.netease.dwrg` |
 | **合计改写** | **33** | |
-| **保留（真实类名）** | **20** | `com.netease.dwrg.Client`、`...Launcher`、`...wxapi.WXPayEntryActivity` 等 |
+| **保留（真实类名）** | **20** | `com.netease.dwrg.Client`、`…Launcher`、`…wxapi.WXPayEntryActivity` |
 
-### 2.4 dex：只改 2 条字符串，绝不做前缀替换
+> 前缀替换是禁区：smali / 清单里的 `Lcom/netease/dwrg/Foo;` 是**类型描述符**，指向真实存在的类，
+> 全局替换会造出几千处指向不存在类的引用 → `NoClassDefFoundError`。所以 dex 侧只认
+> **带引号、整串相等**的字符串（`patch_dex.py` 的 `PKG_STRINGS`），清单侧用
+> **全 dex 类型描述符集合**判定「这是不是类名」。
 
-```
-com/netease/dwrg/Manifest$permission.smali
-  DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION  "com.netease.dwrg"                  -> "com.netease.dwrg.fj"
-  ngpush                                    "com.netease.dwrg.permission.ngpush" -> "com.netease.dwrg.fj.permission.ngpush"
-```
+### 3.3 `resources.arsc` 的包名必须一起改（真机踩过）
 
-> **为什么绝不能全树前缀替换**：smali 里 `Lcom/netease/dwrg/Foo;` 是**类型描述符**，
-> 指向真实存在的类；全局替换会造出 5000+ 处指向不存在类的引用，直接
-> `NoClassDefFoundError`。所以 dex 侧只认**带引号、整串相等**的字符串
-> （`patch_dex.py` 的 `PKG_STRINGS`），清单侧的「是不是类名」则用
-> **全 dex 类型描述符集合**判定：`"L" + s.replace(".", "/") + ";"` 在集合里 → 保留原样。
+第一版没改，结果**点开游戏全程黑屏**：`Resources.getIdentifier(name, type, getPackageName())`
+按**包名**匹配 `resources.arsc` 里 `ResTable_package` 的包名，清单改了而 arsc 没改 → 查到 0 →
+紧接着 `getString(0)` 抛 `Resources$NotFoundException` → `Launcher.onCreate` 挂、游戏 `System.exit(0)`。
 
-### 2.5 `resources.arsc` 里的包名**必须一起改**（真机踩过这个坑）
+修法（`coexist.py patch-arsc`）：包名是**定长字段**（`uint16_t name[128]`，偏移 12、256 字节），
+原地覆盖写新包名 + 补零，**长度、偏移、`assets/res/*.wpk` 索引全都不动**，零副作用。
 
-第一版共存版没改 `resources.arsc`，结果**点开游戏全程黑屏、进不去**。真机 logcat：
+### 3.4 共存性硬指标
 
-```
-E netease.dwrg.fj: Invalid ID 0x00000000.
-E AndroidRuntime: Process: com.netease.dwrg.fj, PID: 6992
-E AndroidRuntime: java.lang.RuntimeException: Unable to start activity
-    ComponentInfo{com.netease.dwrg.fj/com.netease.dwrg.Launcher}:
-    android.content.res.Resources$NotFoundException: String resource ID #0x0
-E AndroidRuntime: 	at com.netease.dwrg.Launcher.onCreate(Launcher.java:280)
-I netease.dwrg.fj: System.exit called, status: 0
-```
+`build.ps1` 第 10 步把官方包与新包都 `aapt2 dump xmltree` 出来逐条比对 authorities 与自定义
+`<permission>`，**有交集直接抛异常中断构建**。实测两边 31 / 31、3 / 3，**无交集**。
 
-**原因**：`Resources.getIdentifier(name, type, defPackage)` 是按**包名**在资源表里查的
-（`AssetManager.getResourceIdentifier()` 拿 `defPackage` 去匹配 `resources.arsc` 里
-`ResTable_package` 的包名）。游戏里大量 SDK 代码写的是
-`getIdentifier(xxx, "string", getPackageName())`，清单包名改成 `com.netease.dwrg.fj`
-而 arsc 里还写着 `com.netease.dwrg` → 查不到 → 返回 **0** → 紧接着 `getString(0)`
-抛 `Resources$NotFoundException` → `Launcher.onCreate` 直接挂，游戏 `System.exit(0)`。
-
-**修法**（`coexist.py patch-arsc`）：`ResTable_package` 的包名是**定长字段**
-（`uint16_t name[128]`，偏移 12、256 字节 UTF-16LE），所以原地覆盖写新包名 + 补零即可，
-**不改任何长度、不动任何偏移、不碰 `assets/res/*.wpk` 的索引**，零副作用。
-实测该 arsc 的全局字符串池里**含包名的字符串 0 条**（16216 条里一条都没有），
-所以除了这个定长字段之外没有别处要改。
-
-> 顺带记下这个教训：**「运行期靠 packageId 不靠包名」只对资源定位成立，
-> 对 `getIdentifier` 这种按名字查的 API 不成立**。凡是改包名，arsc 的 package 名就得跟着改。
-
-### 2.6 实测确认「不用改」的部分
+### 3.5 实测确认「不用改」的部分
 
 | 项 | 结论 | 依据 |
 |---|---|---|
 | `BuildConfig.APPLICATION_ID` | 不用改 | 12 个 dex 全树零引用 |
 | `Lcom/netease/dwrg/...` 类型描述符 | 不用改 | 是类名不是包名 |
-| `"com.netease"` 前缀判断 | 不存在 | 精确匹配 `"com.netease"` 的字符串 **0 处**；170 处 `com.netease.X` 全是无关类名 |
-| `ApkChanneling` 渠道 | 不用处理 | 原包 v2 块只有标准 `id=0x7109871a`，无 `0xFF163163` 自定义渠道块，`getChannel()` 前后都返回 `null` |
-| 既有 `.so` / `assets/` / 其余条目 | 一个字节都不动 | 见第 4.1 节的 zip 逐条对比（只**新增**了我们自己的 `libmmread.so`，见第 4.4 节） |
-| `resources.arsc` 的包名字段 | **必须改** | 见 2.5 节：不改会黑屏 |
+| `ApkChanneling` 渠道 | 不用处理 | 原包 v2 块只有标准 `id=0x7109871a`，无 `0xFF163163` 自定义块；重签后仍只有标准块，`getChannel()` 前后都返回 `null` |
+| 既有 `.so` / `assets/` / 其余条目 | 一个字节都不动 | zip 逐条对比（只**新增**了 `classes13.dex` 与 `libnrt.so`） |
 
-### 2.7 共存性硬指标：authorities / permission 必须无交集
+### 3.6 已知副作用（可接受）
 
-`build.ps1` 第 10 步会把官方包与新包都 `aapt2 dump xmltree` 出来逐条比对，有交集就
-**直接抛异常中断构建**（不是「人工看一眼」）：
-
-```
-官方 authorities 31 条 / 自定义 permission 3 条
-新包 authorities 31 条 / 自定义 permission 3 条
-无交集 OK
-```
-
-一旦有交集，第二个包就会装不上（`CONFLICTING_PROVIDER` / `DUPLICATE_PERMISSION`）。
-
-### 2.8 已知副作用（可接受）
-
-1. `com.netease.dwrg.yxapi.YXEntryActivity` 会被一起改写。清单里写的是这个字符串，
-   但真实类是 `Lim/yixin/sdk/api/BaseYXEntryActivity;`，过不了「类型描述符」判定，
-   于是被当成包名字符串改写。该组件只响应 `yxapp://` scheme 拉起（易信一键登录），
-   **改后这条路径失效**。权衡：不改则两包组件名完全相同（不同包名下同名组件本身不冲突，
-   但会留下「两包组件全同」的隐患），所以选择改写。
-   主流程（账号/手机/微信/QQ/游客登录）不受影响。
-2. 两包共用同一个签名证书 `CN=fjdirect`（同一个 keystore 签两个包名），这是刻意的：
-   以后要发新版本，用同一个 keystore 才能覆盖安装。
+`com.netease.dwrg.yxapi.YXEntryActivity` 会被一起改写（清单里写的是字符串，真实类是
+`Lim/yixin/sdk/api/BaseYXEntryActivity;`，过不了类型描述符判定），**易信一键登录这条路失效**；
+主流程（账号 / 手机 / 微信 / QQ / 游客登录）不受影响。
 
 ---
 
-## 3. 对外接口（只有两个）
+## 4. 签名回填（重打包后还能登录的关键）
 
-| 接口 | 用途 |
-|---|---|
-| `com.fj.direct.Boot.boot(Landroid/content/Context;)V` | smali 在 `attachBaseContext` 里调用，保存 Context 并投递悬浮窗创建 |
-| `com.fj.direct.SigFix.sigs()[Landroid/content/pm/Signature;` | smali 替换官方读签名点，返回**官方证书** |
+smali 侧把官方读签名点换成 `z.a.b.a()`（返回**官方证书**的 `Signature[]`）：
 
-外加 `Boot.ensure()V`（在 `onCreate` 里兜底重试，无参无返回）。
-
----
-
-## 4. 改动一览（改了什么、为什么）
-
-### 4.1 清单 / 资源 / so：只改字符串与 arsc 包名字段，其余零改动
-
-逐条对比原包与**共存版**新包的 zip 中央目录（6073 → 6075 条）：
-
-```
-added   : META-INF/FJDIRECT.RSA, META-INF/FJDIRECT.SF, classes13.dex,
-          lib/arm64-v8a/libmmread.so
-removed : META-INF/H55_KEYS.RSA, META-INF/H55_KEYS.SF
-内容有差异的条目(4): AndroidManifest.xml, classes.dex, resources.arsc, META-INF/MANIFEST.MF
-```
-
-原有条目**顺序与字节完全一致**（`assets/res/*.wpk` 那 400 MB 级
-STORED 资源包原样搬运，否则资源加载会崩），只有末尾旧的 `H55_KEYS.*` 被丢弃、
-新的 `FJDIRECT.*` 由 `apksigner` 追加。
-
-* 既有 `.so`、全部 `assets/` —— **一个字节都没动**；新增了一个我们自己的
-  `lib/arm64-v8a/libmmread.so`（4 408 B，见 4.4 节）；
-* `AndroidManifest.xml` —— **只在共存版有改动**（33 条字符串，见第 2.3 节）；直装版保持原字节；
-* `resources.arsc` —— **只在共存版有改动**（只覆盖 256 字节的包名字段，文件长度不变，见 2.5 节）；
-* `classes.dex` —— 两版都有改动（见 4.2 节）；`classes13.dex` —— 两版都是新增。
-
-### 4.2 `classes.dex`：smali 级最小改动（共存版 23 处 / 直装版 21 处）
-
-**a) 注入入口 2 处** —— `com/netease/ntunisdk/unifix_hotfix_library/proxyApplication/UFProxyApplication`
-
-```smali
-# attachBaseContext 的 super 调用之后
-invoke-super {p0, p1}, Landroid/app/Application;->attachBaseContext(Landroid/content/Context;)V
-+ invoke-static {p1}, Lcom/fj/direct/Boot;->boot(Landroid/content/Context;)V
-
-# onCreate 的 super 调用之后
-invoke-super/range {p0 .. p0}, Landroid/app/Application;->onCreate()V
-+ invoke-static {}, Lcom/fj/direct/Boot;->ensure()V
-```
-
-选这个类是因为它是 SDK 的 **proxy Application**，一定早于游戏主逻辑执行。
-`Boot` 内部用静态 flag 保证只初始化一次，所以即使注入点被多次执行也安全
-（`patch_dex.py` 也做成了幂等，重复运行不会重复插入）。
-
-**b) 签名回填 12 处** —— 把 `PackageInfo->signatures` 的读取换成 `SigFix.sigs()`
-
-```smali
-- iget-object vX, vY, Landroid/content/pm/PackageInfo;->signatures:[Landroid/content/pm/Signature;
-+ invoke-static {}, Lcom/fj/direct/SigFix;->sigs()[Landroid/content/pm/Signature;
-+ move-result-object vX
-```
-
-| 文件 | 处数 |
-|---|---|
-| `com/netease/mpay/d.smali` | 1 |
-| `com/netease/mpay/p.smali` | 1 |
-| `com/netease/mpay/login/c$c.smali` | 1 |
-| `com/netease/ntunisdk/core/logs/Logger.smali` | 1 |
-| `com/netease/ntunisdk/unifix/util/UniFixUtils.smali` | 4 |
-| `com/netease/ntunisdk/unifix_hotfix_library/util/l.smali` | 4 |
-| **合计** | **12** |
-
-**c) 签名回填 9 处（API 28+ 的 `SigningInfo` 链路）** —— 这条链**必须一起补**。
-`PackageInfo.signatures` 虽然被标 deprecated，但 API 28 起网易 SDK 会优先走
-`PackageInfo.signingInfo` → `getApkContentsSigners()` / `getSigningCertificateHistory()`。
-只补 `signatures` 等于在 Android 9+ 上直接把自签名暴露给校验逻辑。补了 9 处：
-
-| 文件 | 改写方式 |
-|---|---|
-| `com/netease/ntunisdk/ngplugin/common/C.smali` | `l()`→`const/4 p0,0x0`；`m()`/`r()`→返回 `SigFix.sigs()` |
-| `com/netease/ntunisdk/unifix/util/UniFixUtils.smali` | 两处内联 `getApkContentsSigners`/`getSigningCertificateHistory` → `SigFix.sigs()`；`hasMultipleSigners` → 常量 0 |
-| `com/netease/ntunisdk/unifix_hotfix_library/util/l.smali` | 同上 |
-
-`C.l/C.m/C.r` 是 `mpay/d`、`mpay/login/c$c` 读 `SigningInfo` 的唯一出口，改这三处即可覆盖支付/登录。
-
-**d) 包名字符串 2 处（仅共存版）** —— `com/netease/dwrg/Manifest$permission.smali` 的两个静态字段：
-
-```smali
-- .field public static final DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION:Ljava/lang/String; = "com.netease.dwrg.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
-+ .field public static final DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION:Ljava/lang/String; = "com.netease.dwrg.fj.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
-- .field public static final ngpush:Ljava/lang/String; = "com.netease.dwrg.permission.ngpush"
-+ .field public static final ngpush:Ljava/lang/String; = "com.netease.dwrg.fj.permission.ngpush"
-```
-
-只做**带引号的完整字符串**精确替换（`patch_dex.py` 的 `PKG_STRINGS`），不做前缀替换 ——
-理由见 2.4 节（类型描述符不能被改写）。
-
-**e) 渠道判定：确认无需改动（重要结论）**
-
-`ApkChanneling.getChannel()` 会解析 **APK v2 签名块** 里 ID 为 `0xFF163163`
-（`SignatureBlock$IdValue.CUSTOM_CHANNEL_ID = -0xe9ce9d`）的 `id-value` 作为渠道值。
-离线解析原包的 v2 块后确认：
-
-```
-id=0x7109871a len=1491   ← 只有标准 v2 块
-```
-
-**原包里根本没有 `0xFF163163` 这个自定义块**，所以原包 `getChannel()` 返回
-`null`，重签后 apksigner 写入的仍只有 `0x7109871a`（`checkV2()` 依旧为 true、
-`getChannel()` 依旧返回 `null`）——**前后行为完全一致，无需硬编码渠道值**。
-
-### 4.3 `classes13.dex`：新增（25 488 B，纯 Java）
-
-与 `classes.dex` 分离编译（`javac --release 8` + `d8 --min-api 21`），
-避开 64K 方法数/寄存器压力，也把回编译风险隔离在一个文件里。
-游戏本身已是 multi-dex（`classes2..12.dex` 都在），minSdk 21 上 ART 会原生加载所有 `classesN.dex`，
-不需要 `MultiDex.install()`。
-
-| 类 | 职责 |
-|---|---|
-| `Boot` | 注入入口，保存 Context、投递悬浮窗 |
-| `MemScanner` | 进程内扫描（`/proc/self/maps` 取区域 + 4.4 节的两条读内存通道） |
-| `MemReader` | 读内存统一入口：优先 native `process_vm_readv`，退回 `/proc/self/mem` |
-| `RoleTable` | 角色索引 → 中文名（72 条映射，从 `身份.h` 整体移植） |
-| `OverlayWindow` | `WindowManager` 悬浮窗：扫描/复制/收起按钮，可拖动，按阵营上色 |
-| `SigFix` | 返回官方 `Signature[]`（DER 硬编码 base64） |
-
-### 4.4 免 root 读内存：为什么最终必须带一个自研 `.so`
-
-这是全流程里**唯一一次**对「不新增 `.so`」的有意放宽，原因是被真实系统挡死了：
-
-**通道 A：`/proc/self/mem`（原方案）—— Android 10+ 不可用。**
-真机（Redmi K20 Pro / Android 13 / SELinux Enforcing）实测：
-
-```
-打开 /proc/self/mem 失败: java.io.FileNotFoundException:
-    /proc/self/mem: open failed: EACCES (Permission denied)
-```
-
-这是 SELinux 层面的拒绝（对 `untrusted_app` 直接不给 `open`），不是权限声明问题，
-Java 侧无解。
-
-**通道 B：`process_vm_readv(getpid(), ...)`（现方案）—— 免 root 可用。**
-它走的是内核
-
-```
-process_vm_rw() → mm_access() → ptrace_may_access() → __ptrace_may_access()
-```
-
-而 `__ptrace_may_access()` 的第一句就是
-`if (same_thread_group(task, current)) return 0;` —— **读「自己」在 LSM 检查之前
-就直接放行**，所以不需要 root、也不需要 `ptrace` 权限。
-（这是「读别人要 root、读自己不要」这句话在内核里的确切出处。）
-
-实现：`src/native/mmread.c`（纯 C，40 行）→ NDK 编成 `lib/arm64-v8a/libmmread.so`，
-**只有 4 408 字节、只导出 1 个符号** `Java_com_fj_direct_MemReader_readSelf`。
-用 `syscall(__NR_process_vm_readv, ...)` 而不是链接 libc 的同名函数，
-因为 bionic 从 API 23 才导出该符号，而我们 minSdk 21。
-
-**为什么这次可以接受新增 `.so`**（评估过程，不是拍脑袋）：
-
-| 反外挂资产 | 内容 | 新增一个自家 so 的影响 |
+| 改写 | 处数 | 文件 |
 |---|---|---|
-| `assets/ntunisdk_so_uuids` | 网易自家 so 的白名单（约 100 条 `路径 + uuid`） | 只是白名单，校验的是**名单内**文件；新增文件不在名单里，也不改动名单 |
-| `assets/probeSoMd5Record.txt` | 网易自家 probe 库在 3 种编译参数下的 md5 | 同上，只覆盖自家文件 |
+| `PackageInfo->signatures` 读取 | 12 | `mpay/d`、`mpay/p`、`mpay/login/c$c`、`ntunisdk/core/logs/Logger`、`ntunisdk/unifix/util/UniFixUtils`(4)、`ntunisdk/unifix_hotfix_library/util/l`(4) |
+| `SigningInfo` 链路（API 28+） | 9 | `ntunisdk/ngplugin/common/C`(3)、`UniFixUtils`(3)、`unifix_hotfix_library/util/l`(3) |
+| 包名字符串（仅共存版） | 2 | `com/netease/dwrg/Manifest$permission` |
+| 注入入口 | 2 | `UFProxyApplication.attachBaseContext` → `Lz/a/a;->a(Landroid/content/Context;)V`；`onCreate` → `Lz/a/a;->b()V` |
 
-另外：**不动任何既有 `.so`**（`libsec-lib.so` / `libenvsdk.so` / `libsecsdk.so` 等
-一个字节没改），.so 名中性、`/proc/self/maps` 里出现的路径与其他 lib 完全同形
-（原包 `extractNativeLibs="true"`，所有 so 都在安装期解压到 `/data/app/.../lib/arm64/`）。
-
-**降级链**：`libmmread.so` 加载失败（比如换了 ABI）→ 自动退回 `/proc/self/mem`
-（Android 9 及以下本来就能用），两条都失败才报错。结果行里会直接标出用的是哪条通道。
-
-真机实测（Redmi K20 Pro / Android 13）：
-
-```
-耗时 7196 ms | 通道 process_vm_readv | 区域 1182 | 读取 3072 MB | 命中 0/12
-```
-
-### 4.5 注入点会命中的**所有**进程：非主进程必须不注入（真机踩过这个坑）
-
-注入点 `UFProxyApplication` 是这个 app 的 `android:name`，而 **Application 在 app 的每个进程里
-都会被创建** —— 这个包里除了游戏主进程，还有一个 `:PushService`（网易推送，清单里声明为
-`com.netease.pushservice.PushService` + `android:process=":PushService"`）。
-
-不拦的后果（真机上就是这么踩的）：
-
-* 两个进程各建一个**位置完全重叠、长得一模一样**的悬浮窗，你点到的很可能是推送进程那个；
-* 而扫描器读的是 `/proc/self/maps`（即「自己这个进程」），在推送进程里读到的是**推送进程的
-  地址空间**，一个角色都不会有 —— 表现为不管在不在对局，永远「未命中任何角色」。
-
-所以 `Boot` 里加了主进程判定，判定不通过就**不注入**（不建悬浮窗）：
-
-```java
-// /proc/self/cmdline 全版本可用、零反射风险；取不到再退回 ActivityThread.currentProcessName()
-String me  = processName();          // "com.netease.dwrg.fj" 或 "com.netease.dwrg.fj:PushService"
-String pkg = ctx.getPackageName();   // "com.netease.dwrg.fj"
-return me == null || pkg == null || me.equals(pkg);
-```
-
-两个进程各自的 `logcat` 长这样（真机 2026-09-11）：
+* **只补 `signatures` 不够**：API 28 起网易 SDK 会优先走
+  `PackageInfo.signingInfo` → `getApkContentsSigners()` / `getSigningCertificateHistory()`，
+  不补就等于在 Android 9+ 上把自签名暴露给校验逻辑；
+* `patch_dex.py` **幂等**，且每次先做一次「旧类名 → 新类名」迁移（`migrate_legacy()`）——
+  否则复用 `work/smali`（`-SkipDecompile`）时会残留旧注入调用，真机表现是启动即
+  `ClassNotFoundException: com.fj.direct.Boot` 然后自杀；
+* 官方证书（`libs/official_cert.der`，从 `META-INF/H55_KEYS.RSA` 偏移 60、长度 845 提取）：
 
 ```
-09-11 16:09:24.625 13099 13099 I FJDirect: 进程判定：cmdline=com.netease.dwrg.fj 包名=com.netease.dwrg.fj 主进程=true
-09-11 16:09:24.625 13099 13099 I FJDirect: Boot.boot 注入成功，context=true
-09-11 16:09:25.691 13099 13099 I FJDirect: 悬浮窗已创建
-09-11 16:11:59.371 20563 20563 I FJDirect: 进程判定：cmdline=com.netease.dwrg.fj:PushService 包名=com.netease.dwrg.fj 主进程=false
+Subject/Issuer: CN=dwrg, OU=dwrg, O=dwrg, L=hz, ST=zj, C=cn
+序列号 758d51d5   SHA256withRSA   有效期 2017-11-13 → 2072-08-16
+SHA-256: 918e39b4e77e4e1e03a7c0236c6f473037851069c67b5ebecf60e9b9744e4dc9
+SHA-1  : b7cb8a61d0b7e0bbdcd8f4a5b12710544cd1c14e
 ```
-
-判定之后 `dumpsys window windows` 里属于本 app、`appop=SYSTEM_ALERT_WINDOW` 的窗口**始终只有 1 个**，
-且它的 `mSession` 指向主进程 pid。
-
-### 4.6 悬浮窗的收起方式与音量键开关（真机逐个验过）
-
-| 操作 | 效果 | 窗口尺寸（dumpsys 实测） |
-|---|---|---|
-| 拖标题栏 | 移动位置 | — |
-| 「收起」 | 只留标题行 + 按钮行，结果区收起 | 688×968 → 688×308 |
-| 「✕」 | 收成一枚 `FJ` 小方块（点它恢复） | 688×968 → 76×89 |
-| 音量减 | 完全隐藏，屏幕上零痕迹 | → 1×1 |
-| 音量加 | 恢复 | 1×1 → 688×968 |
-
-音量键怎么拿到的：进程内用动态代理把 Activity 的 `Window.Callback` 包一层，
-只截 `dispatchKeyEvent` 里的音量键、其余调用原样转发 —— 不用把悬浮窗设成可获焦
-（那样会抢走手柄/键盘/输入法的焦点）。**只有真切换时才吃掉按键**：本来就隐藏着按音量减、
-本来就显示着按音量加，都不拦，音量照常调。
-
-实现上踩过的坑（别再踩）：
-
-1. **生命周期回调在这个包里不生效**：manifest 里的 `UFProxyApplication` 只是网易
-   unifix 热更新的代理，`registerActivityLifecycleCallbacks` 注册成功、日志也打了，
-   但 `onActivityResumed` **一次都不回调**（真机实测），于是拿不到 Activity 去挂按键。
-   现在除了注册，还每隔 2 s 反射扫一遍 `ActivityThread.mActivities` 补挂没挂过的 Activity
-   （靠 `WeakHashMap` 去重，不会重复包）。
-2. **隐藏不能让窗口尺寸归零、也不能把窗口摘掉**（两种都试过，都会卡死）：
-   * `removeViewImmediate` + `addView` → 卡在 `mDrawState=READY_TO_SHOW`、
-     `Surface shown=false`、`alpha=0`，屏幕上看不见也回不来；
-   * 直接 `setVisibility(GONE)` → 尺寸算成 0×0，系统随即把 `mPolicyVisibility` 置 false，
-     再恢复 `VISIBLE` 也回不来（`mEnterAnimationPending=true` 卡住）。
-
-   现在用一个 **1×1 透明占位视图**把窗口撑住，只藏面板和小方块：窗口可见性状态机不动，
-   隐藏/恢复都是瞬间完成。
-3. **未授权 `SYSTEM_ALERT_WINDOW` 时 `addView` 不抛异常**：窗口会正常进 WindowManager，
-   只是被策略隐藏（`mAppOpVisibility=false` / `mPolicyVisibility=false`），表现是
-   「不崩、屏幕上什么都没有」。所以启动时用
-   `AppOpsManager.checkOpNoThrow("android:system_alert_window", uid, pkg)` 主动查一次，
-   没授权就 Toast 提示。**MIUI 上覆盖安装会把这个权限重置成 `ignore`，每次重装后都要重新授权**
-   （命令：`su -c "appops set com.netease.dwrg.fj SYSTEM_ALERT_WINDOW allow"`）。
-4. **「收起 / ✕」曾经根本点不到**：面板宽度是由 ScrollView 的固定宽度决定的，
-   让按钮行用 WRAP_CONTENT 去挤会被压成 0 宽、裁到窗口外面。现在面板宽度显式定 250dp，
-   标题行（标题 + ✕）与按钮行（扫描 / 复制 / 收起，三等分）分两行排。
-
-## 5. 扫描器细节（与 root 版行为对齐）
-
-特征码、字段偏移、守卫**完全沿用** root 版 `模仿者遍历.cpp`：
-
-```
-i+0  ==105(i) i+1==100(d) i+2==120(x) i+5==99(c) i+6==97(a) i+14==105 i+23==105
-+0x3  内存编号 0-11（对外 +1 → 1-12）
-+0xC  阵营 1=侦探团 2=狼人 3=神秘客
-+0x19 起 6 字节 identity，按阵营取第 (camp-1) 字节作为单字节角色索引
-守卫：阵营必须 ∈{1,2,3}；编号必须 ≤11；侦探团/神秘客的索引 0 视为未初始化跳过，狼人的 0 合法
-```
-
-相比原版修掉的两个问题（**为什么这么改**）：
-
-1. **跨块漏命中**：原版按 4096 整页扫描，正好横跨页边界的特征码会被漏掉。
-   这里每次读 `CHUNK + 32` 字节、只扫前 `CHUNK` 个起点，块与块之间天然严丝合缝。
-2. **越界读**：原版 `Name[i+23]` 在 `i` 接近缓冲区尾部时会读越界。
-   这里用 `limit = n - 32` 收敛（`i+0x1B = i+27 < n`）。
-
-其它工程化处理：
-
-* 只扫 `rw` 权限、且 pathname 为空或 `[anon` 的区域（跳过文件映射，避免白读几百 MB 的 .so/.wpk）；
-* 读失败（未驻留页 → `EIO`）按 4096 页步进跳过并计数，不中断整体扫描；
-* 单次扫描字节上限 8 GB，防止极端情况下长时间占用（真机实测：3 GB 只要 7 s，
-  原定的 3 GB 上限会在扫完之前被截断，故放宽到 8 GB）；
-* **按区域分组取最优**：命中先按 `rw-anon` 区域各算一份（区域内按编号去重、取首个命中），
-  最后采信「命中编号最多」的那个区域 —— 对齐 root 版按 `roleCount` 降序取模块的策略。
-  为什么必须这么做：进程里同时存在上一局残留、序列化副本等干扰数据，全局「首个命中」
-  很容易混进过期的编号；而角色数据是 12 个人共用的同一张表，按区域取最全的那份才对得上；
-  某个区域集满 12 个编号就立刻结束扫描；
-* **兜底**：没有任何区域到 5 个编号时（比如刚进对局、数据还没写全），退回
-  「全局按编号去重取首个命中」，宁可少报也不空手；结果行会标出是「采信区域」还是
-  「全局合并」，方便对着 `logcat` 区分来源；
-* 全程后台线程（`FJDirect-scan`），按钮上显示耗时（ms）。
 
 ---
 
-## 6. 构建
+## 5. 读内存通道
 
-### 6.1 依赖
+| 通道 | 可用范围 | 说明 |
+|---|---|---|
+| `process_vm_readv`（默认，native `libnrt.so`） | **Android 10+ 免 root 可用** | 读「自己」在内核里走 `same_thread_group` 快速放行、不经过 LSM |
+| `/proc/self/mem`（降级） | Android 9 及以下 | Android 10+ 被 SELinux 直接拒：`open failed: EACCES (Permission denied)`，Java 侧无解 |
+
+native 加载失败（换 ABI 等）会自动降级到文件路径，不会让扫描器直接崩；结果行会标出用的哪条通道。
+
+---
+
+## 6. 扫描器细节（与 root 版 `模仿者遍历.cpp` 行为对齐）
+
+```
+特征码： [i]==105(i) [i+1]==100(d) [i+2]==120(x) [i+5]==99(c) [i+6]==97(a) [i+14]==105 [i+23]==105
++0x3    内存编号 0-11（对外 +1 → 1-12）
++0xC    阵营 1=侦探团 2=狼人 3=神秘客
++0x19   起 6 字节 identity，按阵营取第 (camp-1) 字节作为单字节角色索引
+守卫：   阵营必须 ∈{1,2,3}；编号 ≤11；侦探团 / 神秘客的索引 0 视为未初始化跳过，狼人的 0 合法
+```
+
+相比原版修掉的两个问题：跨块漏命中（改为每块读 `CHUNK + 32` 字节、只扫前 `CHUNK` 个起点，
+块间重叠 32 字节）、越界读（原版 `Name[i+23]` 在缓冲区尾部越界，这里用 `limit = n - 32` 收敛）。
+
+工程化处理：只扫 `rw` + `anon` 区域；读失败（未驻留页 → `EIO`）按 4096 页步进跳过并计数；
+单次扫描上限 8 GB（真机实测读 3.5 GB 约 18 s，原定 3 GB 上限会在扫完前被截断）；
+**按区域分组取最优**（区域内按编号去重取首个命中，最后采信命中编号最多的区域，
+对齐 root 版按 `roleCount` 降序取模块的策略）；没有任何区域到 5 个编号时退回
+「全局按编号去重取首个命中」；全程后台线程，耗时显示在面板上。
+
+---
+
+## 7. 构建
+
+### 7.1 依赖
 
 | 依赖 | 路径 / 下载 |
 |---|---|
 | JDK 17 | `C:\Program Files\Eclipse Adoptium\jdk-17.0.20.101-hotspot` |
 | Android build-tools 36.0.0 | `E:\Android\Sdk\build-tools\36.0.0`（`aapt2/d8/apksigner/zipalign/dexdump`） |
 | `android.jar` | `E:\Android\Sdk\platforms\android-35\android.jar` |
-| apktool 2.9.3 | `libs/apktool_2.9.3.jar`，23 254 968 B<br>SHA-256 `7956eb04194300ce0d0a84ad18771eebc94b89fb8d1ddcce8ea4c056818646f4`<br>来源：`https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar` |
-| NDK r27d | `E:\Dev\tool\NDK\android-ndk-r27d`（只用 `toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android21-clang.cmd`）<br>找不到时会读环境变量 `ANDROID_NDK_HOME` |
-| 原始 APK | `E:\Dev\workspace\idv\netease_dwrg_20260903.apk`，2 012 889 355 B<br>SHA-256 `0683dd40388bb6fb1d58d4111f80909dc5a2d7a0af07a703f0de73e7e271a5c3` |
+| apktool 2.9.3 | `libs/apktool_2.9.3.jar`，23 254 968 B，SHA-256 `7956eb04194300ce0d0a84ad18771eebc94b89fb8d1ddcce8ea4c056818646f4`，来源 `https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar` |
+| NDK r27d | `E:\Dev\tool\NDK\android-ndk-r27d`（只用 `toolchains\llvm\prebuilt\windows-x86_64\bin\` 下的 `aarch64-linux-android21-clang.cmd` 与 `llvm-nm.exe`），也可用环境变量 `ANDROID_NDK_HOME` 指定 |
+| 原始 APK | `E:\Dev\workspace\idv\netease_dwrg_20260903.apk`，2 012 889 355 B，SHA-256 `0683dd40388bb6fb1d58d4111f80909dc5a2d7a0af07a703f0de73e7e271a5c3` |
 
-> **为什么用 apktool 的 jar 而不是 smali/baksmali**：Maven Central 上的
-> `com.android.tools.smali` 已下架（404）。apktool 2.9.3 内部打包了
-> `brut.androlib.src.SmaliDecoder` / `SmaliBuilder`，`tools/DexTool.java` 用反射直接驱动它们，
-> 效果等价。注意 `com.android.tools.smali.smali.Main` **没有 main 方法**（继承 jcommander Command），
-> 所以不能直接 `java -cp ... Main`，必须走 Decoder/Builder API。
+> 为什么驱动 apktool 的 jar 而不是 smali / baksmali：Maven Central 上的 `com.android.tools.smali`
+> 已下架；apktool 2.9.3 内部打包了 `SmaliDecoder` / `SmaliBuilder`，`tools/DexTool.java` 用反射驱动，
+> 效果等价（`com.android.tools.smali.smali.Main` 没有 main 方法，不能直接 `java -cp … Main`）。
 
-### 6.2 一键构建
+### 7.2 用法
 
 ```powershell
-pwsh -File build.ps1                  # 完整流程（默认 = 共存版，包名 com.netease.dwrg.fj）
+pwsh -File build.ps1                  # 完整构建（默认 = 共存版，包名 com.netease.dwrg.fj，release 静默）
 pwsh -File build.ps1 -OriginalPackage # 直装版（包名与官方一致，需先卸载官方包）
-pwsh -File build.ps1 -SkipDecompile   # 复用 work\smali，只重跑编译/打包/签名
-pwsh -File build.ps1 -V2Only          # 只做 v2 签名（安装要求 Android 7+）
+pwsh -File build.ps1 -SkipDecompile   # 复用 work\smali，只重跑编译/打包/签名（补丁仍会重打 + 迁移旧类名）
+pwsh -File build.ps1 -DebugBuild      # 打开日志（logcat + log.txt），排错用
+pwsh -File build.ps1 -V2Only          # 只做 v2 签名
+pwsh -File build.ps1 -Probe           # 顺带构建遮挡探针 out/probe-overlay.apk（dev-only）
 pwsh -File build.ps1 -OutName x.apk   # 自定义产物名
 ```
 
-流水线步骤（编号与 `build.ps1` 的 `Step` 输出一一对应）：
+### 7.3 流水线
 
-1. `javac` 编译 `tools/DexTool.java`
-2. 从原包抽出 `classes.dex`
-3. `baksmali` 反编译 → `work/smali`（约 40 s，5345 个 `.smali`）
-4. `tools/patch_dex.py` 打补丁（**幂等**，可反复运行）→ 2 个注入点 + 12 个签名点 + 9 个 `SigningInfo` 点（共存版再加 2 条包名字符串）
-5. **（仅共存版）** `tools/coexist.py patch` 生成 `work/AndroidManifest.patched.xml`、`patch-arsc` 生成 `work/resources.patched.arsc`，交给第 9 步用 `--replace` 替换
-6. `smali --api 21` 回编译 → `work/classes.patched.dex`
-7. `javac --release 8`（**必须带 `-encoding UTF-8`**，PowerShell 默认 GBK 会把中文源码编坏）+ `d8 --min-api 21` → `classes13.dex`
-8. **（NDK）** `aarch64-linux-android21-clang -shared -fPIC -O2 -s` 编译 `src/native/mmread.c` → `work/native/libmmread.so`
-9. `tools/repack.py` 流式重打包：换 `classes.dex`、紧随其后插入 `classes13.dex`、`--add` 加 `lib/arm64-v8a/libmmread.so`、其余条目按字节搬运，条目顺序与压缩方式保持不变；`--drop-v1-signature` 丢掉旧的 `H55_KEYS.*`（否则残留旧签名文件会让 v1 校验失败）
-10. `zipalign -f -p 4`（`resources.arsc` 是 STORED，必须 4 字节对齐）
-11. `apksigner sign --v1 --v2 --min-sdk-version 21`
-12. 校验：`apksigner verify -v --print-certs`、`zipalign -c -v 4`、`aapt2 dump badging`（**断言实际包名**）、
-    与官方包的 authorities/permission **无交集断言**、`resources.arsc` 包名与 STORED 断言、
-    `classes13.dex` magic + `dexdump -f`、`libmmread.so` 的 ELF machine/导出符号断言
+1. `javac` 编译 `tools/DexTool.java`；
+2. 从原包抽出 `classes.dex`；
+3. `baksmali` 反编译 → `work/smali`（约 40 s）；
+4. `tools/patch_dex.py`：旧类名迁移 → 2 处注入 + 12 处签名点 + 9 处 `SigningInfo`
+   （共存版再加 2 条包名字符串）；
+5. （仅共存版）`tools/coexist.py patch` 改清单、`patch-arsc` 改 arsc 包名；
+6. `smali --api 21` 回编译 → `work/classes.patched.dex`；
+7. `tools/obf_strings.py` 生成 `work/obf-src/`（248 处密文化）→ 按构建模式钉 `z.a.i.ON`
+   → `javac --release 8 -encoding UTF-8` → **Step 5c 解码自检**（`decode-check 248/248 OK`）
+   → `d8 --min-api 21` → `classes13.dex`；
+8. NDK 编译 `src/native/nrt.c` → `work/native/libnrt.so`，断言动态符号只剩 `JNI_OnLoad`；
+9. `tools/repack.py` 流式重打包：换 `classes.dex`、插入 `classes13.dex`、
+   `--add lib/arm64-v8a/libnrt.so`，其余条目**保序保压缩方式**逐字节搬运，
+   `--drop-v1-signature` 丢掉旧 `H55_KEYS.*`；
+10. `zipalign -f -p 4`（`resources.arsc` 是 STORED，必须 4 字节对齐）；
+11. `apksigner sign --v1 true --v2 true --v3 false --min-sdk-version 21`；
+12. 校验（全自动断言，任何一条不过就中断）：`apksigner verify -v`、`zipalign -c -v 4`、
+    `aapt2 dump badging` 包名断言、authorities / permission 无交集、
+    `resources.arsc` 包名与 STORED 断言、`classes13.dex` magic + `dexdump -f`、
+    `libnrt.so` ELF machine + 包内条目，以及 **`check_stealth` 的四条：`dex`（无禁用明文）、
+    `so`（无 `Java_` / 旧库名 / 品牌字样 / 绑定类名）、`collide`（9 个类名与官方 12 dex 无冲突）、
+    `libname`（不与原包 lib 重名）**。
 
-> zipalign 会往 stderr 刷**上千行** `WARNING: header mismatch`（Android 的 zip 库对原包
-> 自解压条目/数据描述符风格抱怨），是已知噪音，最后仍会打印 `Verification successful`。
-> `build.ps1` 已把它重定向掉。
+> `zipalign` 会往 stderr 刷上千行 `WARNING: header mismatch`（Android zip 库对原包自解压条目风格的抱怨），
+> 是已知噪音，最后仍会打印 `Verification successful`；`build.ps1` 已重定向掉。
 
-### 6.3 密钥
+### 7.4 密钥
 
-`libs/direct.keystore`（`alias=fjdirect`，`storepass=keypass=fjdirect`，PKCS12）由 `build.ps1` 首次运行时用 `keytool` 生成：
-
-```
-SHA-256: 80:65:1B:C5:39:7A:0B:C1:26:88:C2:F3:E4:5E:BE:88:72:F9:8C:3C:49:AC:69:86:0F:22:D9:8B:DE:59:A9:53
-```
+`libs/direct.keystore`（`alias=fjdirect`，`storepass=keypass=fjdirect`，PKCS12），首次运行由
+`build.ps1` 用 `keytool` 生成，证书
+`SHA-256 = 80651bc5397a0bc12688c2f3e45ebe8872f98c3c499ac69860f22d98bde59a953`。
+**本轮 keystore 与上一版保持一致**（同一个 dname），所以覆盖安装不丢数据。
 
 ---
 
-## 7. 验收
+## 8. 验收
 
-### 7.1 静态（已通过，`build.ps1` 第 12 步自动断言）
+### 8.1 静态（`build.ps1` 第 12 步自动断言，全部通过）
 
 | 检查 | 结果 |
 |---|---|
 | `apksigner verify -v` | v1 `true` / v2 `true` / v3 `false`，单签名者 `CN=fjdirect` |
 | `zipalign -c -v 4` | `Verification successful` |
-| `aapt2 dump badging` | 共存版 `com.netease.dwrg.fj` / 直装版 `com.netease.dwrg`；版本号不变、含 `SYSTEM_ALERT_WINDOW`、`native-code: 'arm64-v8a'` |
-| `resources.arsc` 包名 | `com.netease.dwrg.fj`（共存版），仍为 STORED、3 788 696 B 不变 |
-| `classes13.dex` magic | `dex\n035`，25 488 B，`dexdump -f` 解析正常 |
-| `libmmread.so` | aarch64 ELF、4 408 B、只导出 `Java_com_fj_direct_MemReader_readSelf` |
-| 逆向复核（把成品 `classes.dex` 反编译回来再数） | `Boot;->boot(` = **1**、`Boot;->ensure(` = **1**、`SigFix;->sigs()` = **18**、残留 `SigningInfo;->` 调用 = **0**、残留 `PackageInfo;->signatures` 读取 = **0**、残留旧包名字符串 = **0** |
-| zip 逐条对比 | 共存版：`AndroidManifest.xml` / `classes.dex` / `resources.arsc` 变化，新增 `classes13.dex`、`libmmread.so`、`FJDIRECT.*`；原有条目顺序与字节完全一致（见 4.1 节） |
-| 清单往返解析 | `aapt2 dump xmltree` / `dump badging` 均成功；与官方清单逐行 diff 45 行，**全部是预期内的包名改写** |
-| 共存性 | 官方 / 新包 authorities 31 / 31、自定义 permission 3 / 3，**无交集** |
-| AXML 字符串池不变量 | 原/新 flags 均为 `0x00000000`（无排序标志、UTF-16LE）、`stringsStart = 2664`、无 style、offsets 单调 |
+| `aapt2 dump badging` | `com.netease.dwrg.fj` / `262401653` / `2026.0828.1653` / `minSdk 21` / `targetSdk 30` / 含 `SYSTEM_ALERT_WINDOW` / `native-code: 'arm64-v8a'` |
+| `resources.arsc` | 包名 `com.netease.dwrg.fj`，STORED，3 788 696 B 不变 |
+| `classes13.dex` | magic `dex\n035`，46 064 B，`dexdump -f` 正常 |
+| `libnrt.so` | aarch64 ELF、4 904 B、动态符号只有 `JNI_OnLoad` |
+| 共存性 | authorities 31 / 31、自定义 permission 3 / 3，**无交集** |
+| `check_stealth dex` | 无禁用明文；剩余可打印串 354 条（类名 / 字段名等结构性内容） |
+| `check_stealth collide` | 9 个类名与官方 12 个 dex 无冲突 |
+| `check_stealth libname` / `so` | 不与原包 lib 重名；无 `Java_` / 旧库名 / 品牌字样 / 绑定类名 |
+| 字符串自检 | `decode-check 248/248 OK` |
 
-### 7.2 真机
-
-**共存版（推荐：官方包原样保留）**
+### 8.2 真机（release 构建，Redmi K20 Pro / Android 13 / MIUI，2026-09-11）
 
 ```powershell
-adb install -r "out\第五人格-共存版-2026.0828.1653.apk"    # MIUI 会拦 adb install，可改用 root：
-# adb push "out\第五人格-共存版-2026.0828.1653.apk" /data/local/tmp/idv_fj.apk
-# adb shell 'su -c "pm install -r /data/local/tmp/idv_fj.apk"'
-# 设置 → 应用 → 找到新装的那个（图标/名称与官方相同，看应用详情的包名是不是 com.netease.dwrg.fj）
-#      → 显示在其他应用上层 → 允许
-adb logcat -s FJDirect
+# MIUI 会拦 adb install，走 root 装（约 95 s）
+adb push "out\第五人格-共存版-2026.0828.1653.apk" /data/local/tmp/idv_fj.apk
+adb shell 'su -c "pm install -r /data/local/tmp/idv_fj.apk"'
+# MIUI 每次覆盖安装都会把悬浮窗权限重置成 ignore，装完必须重新授权
+adb shell 'su -c "appops set com.netease.dwrg.fj SYSTEM_ALERT_WINDOW allow"'
 ```
-
-**直装版（会顶掉官方包）**
-
-```powershell
-adb uninstall com.netease.dwrg
-adb install -r "out\第五人格-直装版-2026.0828.1653.apk"
-```
-
-1. **共存性**：官方客户端与新装的那个**同时存在**，都能启动、都能登录同一个账号、互不挤掉对方；
-2. 启动能登录（验证签名回填：账号登录成功、支付页可打开）；
-3. 进「模仿者」对局 → 点悬浮窗的「扫描」；
-4. 验收：① 编号 1–12 各出现一次 ② 阵营配色正确（侦探团蓝 `#4FA8FF` / 狼人红 `#FF5A5A` / 神秘客黄 `#FFC93C`）③ 耗时正常（纯 Java 预计数百 ms–十几秒，显示在结果区）④ `adb logcat -s FJDirect` 与悬浮窗内容一致。
-
-**实测记录（2026-09-11，Redmi K20 Pro / Android 13 / MIUI 13 / SELinux Enforcing）**
 
 | 项 | 结果 |
 |---|---|
-| 安装 | `su -c "pm install -r /data/local/tmp/idv_fj.apk"` → `Success`（MIUI 会拦 `adb install`，走 root 装即可） |
-| 与官方共存 | 设备上的官方包是 **4399 渠道版 `com.netease.dwrg.m4399`**，与 `com.netease.dwrg.fj` 互不影响，两个客户端都在 |
-| 启动 | 正常进到游戏（登录界面 + 维护公告），**黑屏已消失** |
-| 悬浮窗 | `FJDirect: 悬浮窗已创建`，屏幕上左上角显示「模仿者·直装 / 扫描 / 复制」 |
-| 悬浮窗控制 | 「收起」688×968→688×308；「✕」→76×89（点小方块恢复）；音量减→1×1、音量加→688×968（`dumpsys window windows` 实测尺寸） |
-| 音量键开关 | `收到按键 KEYCODE_VOLUME_DOWN` → `悬浮窗已隐藏`；`KEYCODE_VOLUME_UP` → `悬浮窗已显示`（按键被吃掉时不改音量） |
-| 悬浮窗归属 | 属于本 app 的 `SYSTEM_ALERT_WINDOW` 窗口**只有 1 个**，`mSession` = 主进程 pid；`:PushService` 进程不再建窗（见 4.5 节） |
-| 扫描（不在对局） | `耗时 2384 ms｜通道 process_vm_readv｜区域 457｜读取 1244 MB｜命中 0/12`（整轮扫完、没触发上限；不在对局所以没有命中，符合预期） |
-| 扫描（游戏加载中） | `耗时 6877 ms｜通道 process_vm_readv｜区域 1293｜读取 3475 MB｜命中 0/12`（同上，未触发 8 GB 上限） |
-| 兜底文件 | `/storage/emulated/0/Android/data/com.netease.dwrg.fj/files/scan.txt` 同步写出结果，内容与悬浮窗一致 |
-| 待你验证 | 登录进游戏 → 进「模仿者」对局 → 点「扫描」，看是否出现编号 1–12 |
+| 安装 / 启动 | `Success`；登录页正常弹出、无黑屏（签名回填生效） |
+| **logcat 静默** | 检索 `FJDirect` / `z.a.` / `模仿者` / `悬浮窗` —— **0 行**；本进程只剩游戏 / ART 自己的日志 |
+| **不落盘** | `/sdcard/Android/data/com.netease.dwrg.fj/files/` 下**没有** `log.txt` / `scan.txt` |
+| 窗口 flag | `dumpsys window`：`ty=APPLICATION_OVERLAY`、`fl=NOT_FOCUSABLE NOT_TOUCHABLE LAYOUT_NO_LIMITS`、`alpha=0.8`、`appop=SYSTEM_ALERT_WINDOW` |
+| 遮挡 | `dumpsys input`：我们的窗口 `inputConfig=NOT_FOCUSABLE \| NOT_TOUCHABLE \| PREVENT_SPLITTING`；游戏 `com.netease.dwrg.Client` 窗口 `inputConfig=0x0` |
+| 音量加 短按 | 面板出现「扫描中…」→ 扫描完成（Toast「扫描完成：0/12（18 602 ms）」）；**音乐音量 10 → 10 不变**（按键确实被我们吃掉） |
+| 音量加 按住 3 s | Toast「已复制」→ 剪贴板拿到结果文本 |
+| 音量减 短按 | 面板隐藏 / 恢复（窗口仍在 WindowManager 里，只是 1×1 占位，`mDrawState=HAS_DRAWN`） |
+| 音量减 按住 5 s | 标题变「已解锁 20s」并逐秒倒计时；`dumpsys window` 的 `fl=` 去掉 `NOT_TOUCHABLE`；**20 s 后自动恢复** `NOT_TOUCHABLE` |
+| 扫描（不在对局） | `耗时 18 602 ms ｜ 通道 process_vm_readv ｜ 区域 1280 ｜ 读取 3 526 MB ｜ 命中 0/12`（登录页当然没有角色数据，符合预期） |
+| 探针实证 | `NOT_TOUCHABLE` 时下层 Activity 收到 `flags=0x100000`（bit0 = 0，无遮挡标记）；切可触摸后同坐标收不到事件 |
 
-### 7.3 失败定位判据
+### 8.3 真机功能验收（需要在「模仿者」对局里做）
+
+进对局 → 音量加短按 → 期望：① 编号 1–12 各出现一次 ② 阵营配色正确
+（侦探团蓝 `#4FA8FF` / 狼人红 `#FF5A5A` / 神秘客黄 `#FFC93C`）③ 耗时正常（数百 ms–十几秒）
+④ 与 root 版 `模仿者遍历.cpp` 同一局的结果一致。
+
+### 8.4 失败定位判据
 
 | 现象 | 判据 |
 |---|---|
-| 装不上 | 对齐/签名问题 → 重跑步骤 8/9；低版本设备改用 `-V2Only` 之外的方式（打开 v1）或反过来 |
+| 装不上 | 对齐 / 签名 → 重跑第 10 / 11 步；MIUI 用 root `pm install -r` |
 | 闪退 | `adb logcat` 看 `avc:`（SELinux）/ ART 错误 |
-| 登录报「应用校验失败」 | 签名点没补全 → 按第 4.2 节的表格补点（先看 `mpay` 与 `unifix` 两族） |
-| 扫描结果为空 | 先看结果行的「通道」：应为 `process_vm_readv`。若显示 `/proc/self/mem` 且报 EACCES，说明 `libmmread.so` 没加载成功（见 4.4 节）；若「区域 0」，看 `adb logcat -s FJDirect` 的诊断行 |
-| 悬浮窗没出现 | 没授权 `SYSTEM_ALERT_WINDOW` → `logcat` 里会有 `创建悬浮窗失败` + Toast 提示；兜底结果写在 `/sdcard/Android/data/<包名>/files/scan.txt`（共存版是 `com.netease.dwrg.fj`） |
+| 启动即 `ClassNotFoundException: com.fj.direct.Boot` | `work/smali` 是旧的且迁移没跑到 → 删掉 `work/smali` 全量构建 |
+| 登录报「应用校验失败」 | 签名点没补全 → 按第 4 节的表补点（先看 `mpay` 与 `unifix` 两族） |
+| 结果为空 | 看结果行的「通道」应为 `process_vm_readv`；若显示 `/proc/self/mem` 且 EACCES，说明 `libnrt.so` 没加载成功 |
+| 悬浮窗没出现 | 没授权 `SYSTEM_ALERT_WINDOW`（MIUI 覆盖安装后会重置）→ `appops set … allow` 后重开游戏 |
+| 想排错但没有任何日志 | 装的是 release 包 → 换 `-DebugBuild` 构建 |
 
 ---
 
-## 8. 已知边界（想清楚再动）
+## 9. 已知边界与残余风险（消除不掉的部分，写清楚）
 
-1. **不动任何既有 `.so`，只新增一个自研 `.so`**（`lib/arm64-v8a/libmmread.so`，4 408 B）。
-   这是被系统逼出来的：Android 10+ 上 `/proc/self/mem` 被 SELinux 拒（实测 EACCES），
-   只剩 `process_vm_readv` 这一条免 root 的路，而它需要 native 代码（详见 4.4 节）。
-   反外挂的两个资产 `assets/ntunisdk_so_uuids`、`assets/probeSoMd5Record.txt` 都是
-   **网易自家 so 的白名单/md5 记录**，新增一个不在名单里的 so 不改动、也不违反它们；
-   但如果将来发现被 `libenvsdk.so` 的 maps 正则扫出来（会打 `FJDirect` 之外的日志、
-   或游戏直接启动失败），**回退方案**是：把 so 改名成更像系统库的名字、
-   或者改用 `dlopen` 从 `base.apk` 内直接加载（`extractNativeLibs="true"` 下不可行，
-   需改清单）、或者退回「只支持 Android 9 及以下用 /proc/self/mem」。
-2. **既有 `.so` 里的反外挂面一个字节都别碰**：`libsec-lib.so`（TracerPid/su/Xposed/Substrate/模拟器）、
-   `libenvsdk.so`（PCRE2 正则扫 maps）、`libybuaxx.so`（`Java_com_netease_ybuax_*` 风控）、
-   `libsecsdk.so`（dex 分析/VMP）、`assets/emulatordetector_data`。
-3. **`SkinSecurity` 未补丁（评估后判定无需补）**：它用 `JarFile`/`JarEntry.getCertificates()`
-   直接读 **皮肤 APK 文件**（`new File(path)` → `AssetManager`）的 JAR 证书，比对内置
-   allowlist `{d88039b9…, e54eb91a…}`；不涉及主包，最多影响皮肤加载。
-   注意：这条路径读的是**真实 JAR 证书**，我们无法伪造（没有官方私钥），与本次登录/支付无关。
-4. **`classes.dex` 字符串少了 10 条**：57039 → 57029，逐条 diff 确认只少了未被使用的
-   debug 局部变量名（`baos / extJsonObj / initListner / isBindSuccess / jsonObjects / jsout /
-   paramJsonObj / paramObj / strInputstream / ver`），无 extra、无功能影响。
-5. **直装版换包丢数据**：直装版必须先 `adb uninstall` 官方包，会清掉本地数据/缓存，登录要重新验证；
-   **共存版没有这个问题** —— 新包名意味着全新的数据目录，官方包的数据与登录态原样保留。
-6. **smali 回编译是确定性输出**：同一棵 `work/smali` 连续编译两次 SHA-256 完全一致，
-   所以"补丁是否真的进包了"可以用哈希对拍。
+| # | 残余 | 为什么消不掉 |
+|---|---|---|
+| 1 | **自签证书** `CN=fjdirect` | 没有官方私钥，无法伪造官方签名；只能靠第 4 节的回填骗过 SDK 的**自查**，瞒不过服务端按证书哈希核对 |
+| 2 | **包名 `com.netease.dwrg.fj`** ≠ 官方 | 共存版的定义就是换包名；直装版可保持官方包名，但要卸载官方包 |
+| 3 | **`classes.dex` 与官方字节不同** | 注入入口与签名回填必须改它；只能做到「改动最小」（共存版 23 处 / 直装版 21 处） |
+| 4 | **APK 多 2 个条目** | `classes13.dex`（我们的全部逻辑）、`lib/arm64-v8a/libnrt.so`（进程内自读）；包体因此多约 25 KB |
+| 5 | **`/proc/self/maps` 里多一条 `libnrt.so` 映射** | 只要用 native 通道就必然存在；已做到「库名中性、路径与其他 lib 同形」（原包 `extractNativeLibs="true"`，所有 so 都解压到 `/data/app/.../lib/arm64/`） |
+| 6 | **音量键被占用** | 短按 / 长按全靠它区分；调音量改用系统面板或游戏内设置 |
+| 7 | **解锁的 20 s 内窗口可触摸** | 这段窗口期内游戏侧触摸会带 `FLAG_WINDOW_IS_OBSCURED`；对局中保持上锁即可（标题显示倒计时，一眼可见） |
+| 8 | 服务端按证书哈希 / 包名 / 包体完整性核对 | 原理性限制，无解 |
+
+> 结论：本轮把**可消除的静态特征（dex 明文、JNI 符号、库名）、运行期痕迹（logcat、落盘）、
+> 以及交互副作用（被遮挡标记）**都处理掉了；剩下的 1–5 是「注入式方案 + 重打包」的
+> 结构性代价，只能减小、不能消除。
 
 ---
 
-## 9. 仓库结构
+## 10. 仓库结构
 
 ```
 idv-mimic-direct/
-├── build.ps1                     # 一键流水线，12 步（默认共存版；-OriginalPackage 切直装版）
-├── src/native/
-│   └── mmread.c                  # process_vm_readv 自读（免 root 的关键，40 行 C）
-├── src/com/fj/direct/
-│   ├── Boot.java                 # 注入入口
-│   ├── MemScanner.java           # 进程内扫描器（/proc/self/maps + 两条读通道）
-│   ├── MemReader.java            # 读内存统一入口：native 优先、文件兜底
-│   ├── RoleTable.java            # 角色索引 → 中文名（72 条）
-│   ├── OverlayWindow.java        # 悬浮窗 + 上色 + 复制/收起
-│   └── SigFix.java               # 官方签名回填
+├── build.ps1                     # 一键流水线（默认共存版 release；-DebugBuild / -OriginalPackage / -Probe）
+├── src/
+│   ├── native/nrt.c              # process_vm_readv 自读 + JNI_OnLoad/RegisterNatives
+│   └── z/a/                      # 中性短类名（见 2.2 的映射表）
+│       ├── a.java                # 注入入口
+│       ├── b.java                # 官方签名回填
+│       ├── c.java                # 进程内扫描器
+│       ├── d.java                # 读内存入口（native 优先、文件兜底）
+│       ├── e.java                # 角色表（72 条）
+│       ├── f.java                # 悬浮窗（NOT_TOUCHABLE + 倒计时 + 复制）
+│       ├── g.java                # 音量键手势状态机
+│       ├── h.java                # 字符串解密（密钥唯一真源）
+│       └── i.java                # 日志门面（release 全静默）
 ├── tools/
 │   ├── DexTool.java              # 反射驱动 apktool 的 SmaliDecoder/SmaliBuilder
-│   ├── patch_dex.py              # smali 补丁（幂等）
-│   ├── coexist.py                # 共存版：清单字符串池重写（33 改 / 20 留）+ arsc 包名字段
-│   └── repack.py                 # 保序保压缩方式的流式重打包
-├── libs/
-│   ├── apktool_2.9.3.jar         # 不入库，见 6.1 下载地址
-│   ├── official_cert.der         # 从 META-INF/H55_KEYS.RSA 提取的官方 X.509（845 B）
-│   ├── official_cert.b64
-│   └── direct.keystore           # 不入库
-└── .gitignore                    # *.apk / work/ / out/ / *.keystore / *.jar
+│   ├── patch_dex.py              # smali 补丁（幂等 + 旧类名迁移）
+│   ├── obf_strings.py            # 字符串密文化（生成 work/obf-src + 自检类）
+│   ├── check_stealth.py          # 四条隐身断言（dex / so / collide / libname）
+│   ├── coexist.py                # 共存版：清单字符串池 + arsc 包名字段
+│   ├── repack.py                 # 保序保压缩方式的流式重打包
+│   ├── build_probe.ps1           # 遮挡探针构建（dev-only）
+│   └── probe/                    # 探针源码（dev-only，不随发布包分发）
+└── libs/
+    ├── apktool_2.9.3.jar         # 不入库（见 7.1 的下载地址与 SHA-256）
+    ├── official_cert.der/.b64    # 从 META-INF/H55_KEYS.RSA 提取的官方 X.509
+    └── direct.keystore           # 不入库
 ```
-
-官方证书指纹（供核对，`libs/official_cert.der`）：
-
-```
-Subject/Issuer: CN=dwrg, OU=dwrg, O=dwrg, L=hz, ST=zj, C=cn
-序列号: 758d51d5     算法: SHA256withRSA     有效期: 2017-11-13 → 2072-08-16
-SHA-256: 918e39b4e77e4e1e03a7c0236c6f473037851069c67b5ebecf60e9b9744e4dc9
-SHA-1  : b7cb8a61d0b7e0bbdcd8f4a5b12710544cd1c14e
-MD5    : 08e1a6f478f1ac2098edf5125de5655b
-```
-
-> 提取方式：`META-INF/H55_KEYS.RSA` 是 PKCS#7，证书在**偏移 60、长度 845**。
-> 该文件没有 PEM 头，所以 `keytool -printcert` 会报"无法解析输入"，用 Java
-> `CertificateFactory` 或 `new Signature(der)` 都能正常解析（已实测）。
 
 ---
 
-## 10. 许可与声明
+## 11. 许可与声明
 
 仅供本人对**自有设备上的游戏客户端**做内存结构研究之用。
 仓库不包含游戏原始 APK 与官方密钥，构建需要自备原包与合法授权。
