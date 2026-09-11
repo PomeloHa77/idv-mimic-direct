@@ -87,12 +87,12 @@ pwsh -File build.ps1 -OriginalPackage # 直装版（包名与官方一致，需�
 编码（Python 侧）  c[i] = p[i] ^ K[(i * 5 + 7) & 15]
 解码（Java 侧）    src/z/a/h.java 的 a(byte[])，与上式逐字节对称
 密钥 K             唯一真源是 h.java 里的 16 字节数组，脚本解析它，两边不一致构建直接失败
-本次结果           9 个文件、248 处字面量全部密文化（0 处跳过）
+本次结果           9 个文件、254 处字面量全部密文化（0 处跳过）
 ```
 
 * 产物只落在 `work/obf-src/`，`src/` 保持可读 —— 改源码由 `javac/d8` 保证 dex 合法，
   比在 dex 里原地改 `string_data_item`（uleb128 长度 + MUTF-8，连长度都改不了）安全得多；
-* 构建期自检：把每一处密文在 **JVM 上解回来**与原文逐条比对，`decode-check 248/248 OK`
+* 构建期自检：把每一处密文在 **JVM 上解回来**与原文逐条比对，`decode-check 254/254 OK`
   才算通过（`build.ps1` Step 5c）—— 证明「Python 编码面」与「Java 解码面」100% 对称；
 * 已知边界：`case "字面量":` 这类必须保持编译期常量的位置一律跳过并打印清单
   （本仓库源码里没有，所以是 0 跳过；将来出现也不会静默出错）。
@@ -116,7 +116,7 @@ pwsh -File build.ps1 -OriginalPackage # 直装版（包名与官方一致，需�
 窗口 flag 常驻 `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCHABLE | FLAG_LAYOUT_NO_LIMITS`：
 **看得见、点不到** —— 窗口不参与输入命中测试，游戏侧永远收不到被遮挡标记。
 代价是不可触摸的窗口既点不到按钮也拖不动，所以交互全部改由音量键驱动（2.5 节），
-只有「临时解锁」的 20 秒里才能拖动 / 点按钮。
+只有「临时解锁」的 10 秒里才能拖动 / 点按钮。
 
 **遮挡实证**（两级）：
 
@@ -141,14 +141,24 @@ pwsh -File build.ps1 -Probe     # 顺带产出 out/probe-overlay.apk（dev-only�
 | 键 | 短按 | 长按 |
 |---|---|---|
 | 音量 **加** | 扫描（结果直接显示在面板上；不在对局时会显示 `命中 0/12`） | 按住 **3.0 s** → 复制结果到剪贴板（Toast「已复制」） |
-| 音量 **减** | 显示 / 隐藏悬浮窗 | 按住 **5.0 s** → 解锁触摸 **20 s**（可拖动面板、点按钮；到时自动上锁，再按住 5 s 立即上锁） |
+| 音量 **减** | 收起面板（收起后音量键就还给系统） | 按住 **5.0 s** → 解锁触摸 **10 s**（可拖动面板、点按钮；到时自动上锁，再按住 5 s 立即上锁） |
 
-* 音量键事件**全部吞掉**（否则无法区分「短按」和「按住 3 / 5 秒」）。
-  **副作用：游戏内音量键被占用，调音量请用系统面板或游戏内设置。**
+**面板收起后，音量键交还系统**（这是「抢按键」的修复）：
+
+| 键（面板收起时） | 行为 |
+|---|---|
+| 音量 **减** | `return false` 原样放行 → 系统正常调音量、弹系统音量条 |
+| 音量 **加** | 拦下来叫回面板，**并由我们自己补一次音量**（`AudioManager.adjustStreamVolume` + `FLAG_SHOW_UI`，效果与原生一致） |
+
+* 「面板显示中」必须把音量键吃掉：要区分「短按」和「按住 3 / 5 秒」就得先拦 DOWN
+  自己计时，否则系统会先把音量调掉、音量条还弹出来。**副作用只在这个状态下存在**：
+  对局里想调音量，先按一下音量减把面板收起来即可。
+* 为什么收起后音量加还要拦、还要自己补音量：必须留一条「把面板叫回来」的路；
+  而系统音量已经最大时按键不产生音量变化，靠下面那条「音量变化」兜底路会失灵。
 * 解锁期间标题变成「已解锁 Ns」倒计时，一眼能看出当前是可触摸状态。
 * **「扫描 / 复制 / 收起 / ✕」四个按钮平时不显示**：窗口不可触摸时它们点了也没反应，
   摆在那儿只是视觉噪音、还让人误以为能点。所以平时面板上只有标题 + 结果
-  （外加一行手势提示），**按住音量减解锁的那一刻按钮才出现**，20 秒倒计时结束自动消失。
+  （外加一行手势提示），**按住音量减解锁的那一刻按钮才出现**，10 秒倒计时结束自动消失。
   解锁时如果面板处于「收起 / 最小化」状态，会一并还原成完整面板 ——
   「解锁成功但屏幕上什么都没有」比不解锁更让人困惑。
 * 怎么拿到按键又不抢焦点：用 `Proxy` 把 Activity 的 `Window.Callback` 包一层，只截
@@ -156,10 +166,14 @@ pwsh -File build.ps1 -Probe     # 顺带产出 out/probe-overlay.apk（dev-only�
   一个字节都不变）。没有把悬浮窗设成可获焦（那样会抢走手柄/键盘/输入法的焦点）。
 * 为什么还要反射补捞 Activity：这个包用网易 unifix 热更新代理，manifest 里的
   `UFProxyApplication` 只是代理，`registerActivityLifecycleCallbacks` 真机实测
-  **一次都不回调** → 除注册外，每 2 s 反射扫一遍 `ActivityThread.mActivities` 补挂
-  （`WeakHashMap` 去重，不会重复包）。
+  **一次都不回调** → 除注册外，定期反射扫一遍 `ActivityThread.mActivities` 补挂
+  （`WeakHashMap` 去重，不会重复包）。**整个反射过程跑在后台 `HandlerThread` 上**：
+  真机实测放主线程时，游戏里每 2 s 稳定掉一帧（`SurfaceFlinger --latency` 里每 2 s
+  一个 33 ms 间隔），移到后台后这个周期性掉帧消失；间隔从 3 s 起、连续 4 轮没有新
+  Activity 就降到 12 s。
 * 兜底通道：`Settings.System` 音量值 + `ContentObserver`（不需权限），只在
-  「按键钩子没装上」时起作用，映射仍是显示 / 隐藏。
+  「按键钩子没装上」时起作用。**按键通道一旦真的收到过音量键，这条兜底通道就永久失效**
+  （`sKeySeen`）—— 否则两条通道会互相打架：用系统音量条调一下，面板就被它藏起来 / 叫出来。
 
 ### 2.6 静默：release 不打日志、不落盘
 
@@ -337,8 +351,8 @@ pwsh -File build.ps1 -OutName x.apk   # 自定义产物名
    （共存版再加 2 条包名字符串）；
 5. （仅共存版）`tools/coexist.py patch` 改清单、`patch-arsc` 改 arsc 包名；
 6. `smali --api 21` 回编译 → `work/classes.patched.dex`；
-7. `tools/obf_strings.py` 生成 `work/obf-src/`（248 处密文化）→ 按构建模式钉 `z.a.i.ON`
-   → `javac --release 8 -encoding UTF-8` → **Step 5c 解码自检**（`decode-check 248/248 OK`）
+7. `tools/obf_strings.py` 生成 `work/obf-src/`（254 处密文化）→ 按构建模式钉 `z.a.i.ON`
+   → `javac --release 8 -encoding UTF-8` → **Step 5c 解码自检**（`decode-check 254/254 OK`）
    → `d8 --min-api 21` → `classes13.dex`；
 8. NDK 编译 `src/native/nrt.c` → `work/native/libnrt.so`，断言动态符号只剩 `JNI_OnLoad`；
 9. `tools/repack.py` 流式重打包：换 `classes.dex`、插入 `classes13.dex`、
@@ -381,7 +395,7 @@ pwsh -File build.ps1 -OutName x.apk   # 自定义产物名
 | `check_stealth dex` | 无禁用明文；剩余可打印串 364 条（类名 / 字段名等结构性内容） |
 | `check_stealth collide` | 9 个类名与官方 12 个 dex 无冲突 |
 | `check_stealth libname` / `so` | 不与原包 lib 重名；无 `Java_` / 旧库名 / 品牌字样 / 绑定类名 |
-| 字符串自检 | `decode-check 248/248 OK` |
+| 字符串自检 | `decode-check 254/254 OK` |
 
 ### 8.2 真机（release 构建，Redmi K20 Pro / Android 13 / MIUI，2026-09-11）
 
@@ -400,12 +414,14 @@ adb shell 'su -c "appops set com.netease.dwrg.fj SYSTEM_ALERT_WINDOW allow"'
 | **不落盘** | `/sdcard/Android/data/com.netease.dwrg.fj/files/` 下**没有** `log.txt` / `scan.txt` |
 | 窗口 flag | `dumpsys window`：`ty=APPLICATION_OVERLAY`、`fl=NOT_FOCUSABLE NOT_TOUCHABLE LAYOUT_NO_LIMITS`、`alpha=0.8`、`appop=SYSTEM_ALERT_WINDOW` |
 | 遮挡 | `dumpsys input`：我们的窗口 `inputConfig=NOT_FOCUSABLE \| NOT_TOUCHABLE \| PREVENT_SPLITTING`；游戏 `com.netease.dwrg.Client` 窗口 `inputConfig=0x0` |
-| 音量加 短按 | 面板出现「扫描中…」→ 扫描完成（Toast「扫描完成：0/12（18 602 ms）」）；**音乐音量 10 → 10 不变**（按键确实被我们吃掉） |
+| 音量加 短按（面板显示中） | 面板出现「扫描中…」→ 扫描完成；**音乐音量 10 → 10 不变**（按键确实被我们吃掉） |
 | 音量加 按住 3 s | Toast「已复制」→ 剪贴板拿到结果文本 |
-| 音量减 短按 | 面板隐藏 / 恢复（窗口仍在 WindowManager 里，只是 1×1 占位，`mDrawState=HAS_DRAWN`） |
-| 音量减 按住 5 s | 标题变「已解锁 20s」并逐秒倒计时；`dumpsys window` 的 `fl=` 去掉 `NOT_TOUCHABLE`；**20 s 后自动恢复** `NOT_TOUCHABLE` |
-| 按钮可见性 | 锁定态：面板只有「模仿者·直装」+ 结果，**没有按钮**；解锁态：出现「已解锁 18s」+ ✕ + 扫描 / 复制 / 收起；自动上锁后按钮自动消失；锁定态下音量加短按照样能扫描（面板显示「扫描中…」） |
-| 扫描（不在对局） | `耗时 18 602 ms ｜ 通道 process_vm_readv ｜ 区域 1280 ｜ 读取 3 526 MB ｜ 命中 0/12`（登录页当然没有角色数据，符合预期） |
+| 音量减 短按 #1（面板显示中） | 只收起面板：`Requested w=688 h=749` → `w=1 h=1`，**音乐音量 10 → 10 不变** |
+| 音量减 短按 #2 / #3（面板已收起） | **放行给系统**：音量 10 → 0（= 一档 → 静音，`cmd media_session volume --get --stream 3` 实测） |
+| 音量加 短按（面板已收起） | 面板被叫回（`w=1 h=1` → `688x749`）+ **音量自己补一档**（0 → 10），两者同时发生 |
+| 音量减 按住 5 s | 标题变「已解锁 Ns」并逐秒倒计时；`dumpsys window` 的 `fl=` 去掉 `NOT_TOUCHABLE`（`Requested h` 688 → 968，按钮行出现）；**10 s 后自动恢复** `NOT_TOUCHABLE` |
+| 按钮可见性 | 锁定态：面板只有「模仿者·直装」+ 结果，**没有按钮**；解锁态：出现「已解锁 9s」+ ✕ + 扫描 / 复制 / 收起，并弹 Toast「已解锁触摸 10 秒」；自动上锁后按钮自动消失；锁定态下音量加短按照样能扫描 |
+| 扫描（不在对局） | `耗时 20 605 ms ｜ 通道 process_vm_readv ｜ 区域 1294 ｜ 读取 3 671 MB ｜ 命中 0/12`（登录页当然没有角色数据，符合预期） |
 | 探针实证 | `NOT_TOUCHABLE` 时下层 Activity 收到 `flags=0x100000`（bit0 = 0，无遮挡标记）；切可触摸后同坐标收不到事件 |
 
 ### 8.3 真机功能验收（需要在「模仿者」对局里做）
@@ -426,6 +442,32 @@ adb shell 'su -c "appops set com.netease.dwrg.fj SYSTEM_ALERT_WINDOW allow"'
 | 悬浮窗没出现 | 没授权 `SYSTEM_ALERT_WINDOW`（MIUI 覆盖安装后会重置）→ `appops set … allow` 后重开游戏 |
 | 想排错但没有任何日志 | 装的是 release 包 → 换 `-DebugBuild` 构建 |
 
+### 8.5 卡顿 / 抢按键排查（2026-09-11，真机实测 + 对照组）
+
+用户反馈：进游戏后卡顿不流畅、转视角也卡、偶尔抢按键。逐条假设 → 验法 → 结论：
+
+| 假设 | 验法 | 结论 |
+|---|---|---|
+| 悬浮窗那层把游戏挤到 GPU 合成 | `dumpsys SurfaceFlinger` 的 `(active) HWC layers` 表里看每一层的 Comp Type | **不成立**：我们的层（`Window Type=2038`，749×688）是 `DEVICE`（HWC），不是 `CLIENT`（GPU）；游戏层同样是 DEVICE |
+| 悬浮窗自己在吃帧 | A/B：面板显示（749×688 半透明层）与音量减收起（1×1）各测 32 s，`SurfaceFlinger --latency` 统计 >25 ms 的帧间隔 | **不成立**：两边都是 **11 次 / 32 s**，完全一样 |
+| 这些掉帧是我们的代码造成的 | 用同版本官方客户端 `com.netease.dwrg.m4399`（`2026.0828.1653`，未注入）当对照 | **不成立**：官方 60 fps 下 25 s 内 **10 次**掉帧（最慢一帧 215 ms），比我们（60 fps 下 32 s 内 11 次）还多 |
+| 主线程有周期性任务 | `z.a.g` 每 2 s 在主线程反射 `ActivityThread.mActivities` | **成立**：已整段移到后台 `HandlerThread`；间隔 3 s 起，连续 4 轮没新 Activity 降到 12 s |
+| 扫描把 ART 的 GC 按住 | 旧版 native 走 `GetPrimitiveArrayCritical(byte[])`，一次扫描连读 3.5 GB | **成立**：改成 direct `ByteBuffer`（native 直写堆外内存），完全不进 GC 临界区 |
+| 扫描占满一个核抢游戏时间片 | `top -H`（旧版）：游戏主线程 35.7%、我们的扫描线程 13–16%、`HeapTaskDaemon` 一度 17.2% | **成立**：加 `THREAD_PRIORITY_BACKGROUND` + 每 32 MB `sleep(2 ms)`；实测扫描期间（22 s 窗口、30 fps 档位）掉帧 **0** |
+| 热降频 | `cpufreq/scaling_cur_freq`、`thermal_zone*/temp` | **不成立**：42–47 ℃、频率正常爬升，没降频 |
+| 音量键被无条件吞掉 | 面板收起后按音量减 / 加 | **成立**：见 2.5 节，已改成「收起后放行」 |
+
+顺带记录一条**游戏自身**的行为（不是我们能改的，官方客户端同样如此）：本进程在登录 /
+大厅界面每 2–4.5 s 一次 `Background concurrent copying GC`，`paused 10.4–22.1 ms`、
+每次回收约 120 万对象 / 35 MB（`adb logcat | grep "concurrent copying GC"` 可见）。
+STW 撞上 vsync 就掉一帧 —— 那 33 ms 的间隔主要来自这里和游戏自己的渲染节奏，
+不是悬浮窗。
+
+> 还要注意：`nice 19`（`THREAD_PRIORITY_LOWEST`）实测会把扫描拖到 20 s 以上
+> （3.6 GB ≈ 180 MB/s，被内核放到小核 + 分页缺页 I/O 主导），所以最后定在
+> `THREAD_PRIORITY_BACKGROUND`。扫描慢的根因是缺页/换页 I/O（本机 8 GB swap 已用
+> 1.6 GB），不是 CPU 优先级。
+
 ---
 
 ## 9. 已知边界与残余风险（消除不掉的部分，写清楚）
@@ -437,8 +479,8 @@ adb shell 'su -c "appops set com.netease.dwrg.fj SYSTEM_ALERT_WINDOW allow"'
 | 3 | **`classes.dex` 与官方字节不同** | 注入入口与签名回填必须改它；只能做到「改动最小」（共存版 23 处 / 直装版 21 处） |
 | 4 | **APK 多 2 个条目** | `classes13.dex`（我们的全部逻辑）、`lib/arm64-v8a/libnrt.so`（进程内自读）；包体因此多约 25 KB |
 | 5 | **`/proc/self/maps` 里多一条 `libnrt.so` 映射** | 只要用 native 通道就必然存在；已做到「库名中性、路径与其他 lib 同形」（原包 `extractNativeLibs="true"`，所有 so 都解压到 `/data/app/.../lib/arm64/`） |
-| 6 | **音量键被占用** | 短按 / 长按全靠它区分；调音量改用系统面板或游戏内设置 |
-| 7 | **解锁的 20 s 内窗口可触摸** | 这段窗口期内游戏侧触摸会带 `FLAG_WINDOW_IS_OBSCURED`；对局中保持上锁即可（标题显示倒计时，一眼可见） |
+| 6 | **面板显示中音量键被占用** | 短按 / 长按全靠它区分；对局里要调音量先按一下音量减把面板收起来（收起后音量键交还系统） |
+| 7 | **解锁的 10 s 内窗口可触摸** | 这段窗口期内游戏侧触摸会带 `FLAG_WINDOW_IS_OBSCURED`；对局中保持上锁即可（标题显示倒计时，一眼可见） |
 | 8 | 服务端按证书哈希 / 包名 / 包体完整性核对 | 原理性限制，无解 |
 
 > 结论：本轮把**可消除的静态特征（dex 明文、JNI 符号、库名）、运行期痕迹（logcat、落盘）、
