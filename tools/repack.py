@@ -116,12 +116,18 @@ def main():
     ap.add_argument("--classes-dex", required=True)
     ap.add_argument("--extra-dex", action="append", default=[],
                     help="形如 classes13.dex=路径，可重复")
+    ap.add_argument("--replace", action="append", default=[],
+                    help="形如 AndroidManifest.xml=路径，用新内容替换该条目（deflate），可重复")
     ap.add_argument("--drop-v1-signature", action="store_true",
                     help="丢弃原包 META-INF 下的 v1 签名文件（MANIFEST.MF/*.SF/*.RSA/*.DSA），"
                          "避免重签后残留旧签名文件导致 v1 校验失败或被识别为多签名者")
     args = ap.parse_args()
 
     patched = open(args.classes_dex, "rb").read()
+    replaces = {"classes.dex": patched}
+    for spec in args.replace:
+        name, _, path = spec.partition("=")
+        replaces[name] = open(path, "rb").read()
     extras = []
     for spec in args.extra_dex:
         name, _, path = spec.partition("=")
@@ -155,22 +161,24 @@ def main():
             replaced = 0
             for e in entries:
                 name = e.name.decode("utf-8", "replace")
-                if name == "classes.dex":
-                    comp = deflate(patched)
+                if name in replaces:
+                    payload = replaces[name]
+                    comp = deflate(payload)
                     lho = o.tell()
-                    write_local(o, e, 8, zlib.crc32(patched) & 0xffffffff, len(comp), len(patched), comp)
-                    new_cd.append((e, 8, zlib.crc32(patched) & 0xffffffff, len(comp), len(patched), lho))
+                    write_local(o, e, 8, zlib.crc32(payload) & 0xffffffff, len(comp), len(payload), comp)
+                    new_cd.append((e, 8, zlib.crc32(payload) & 0xffffffff, len(comp), len(payload), lho))
                     replaced += 1
-                    # 附加 dex 紧跟 classes.dex（即 classes12.dex 之后）写入
-                    for xname, xdata in extras:
-                        xe = Entry(ver_made=e.ver_made, ver_need=e.ver_need, flags=0, method=0,
-                                   mtime=e.mtime, mdate=e.mdate, name=xname.encode("utf-8"),
-                                   extra=b"", comment=b"", iattr=0, eattr=e.eattr, lho=0)
-                        comp2 = deflate(xdata)
-                        lho2 = o.tell()
-                        write_local(o, xe, 8, zlib.crc32(xdata) & 0xffffffff, len(comp2), len(xdata), comp2)
-                        new_cd.append((xe, 8, zlib.crc32(xdata) & 0xffffffff, len(comp2), len(xdata), lho2))
-                    extras = []
+                    if name == "classes.dex":
+                        # 附加 dex 紧跟 classes.dex（即 classes12.dex 之后）写入
+                        for xname, xdata in extras:
+                            xe = Entry(ver_made=e.ver_made, ver_need=e.ver_need, flags=0, method=0,
+                                       mtime=e.mtime, mdate=e.mdate, name=xname.encode("utf-8"),
+                                       extra=b"", comment=b"", iattr=0, eattr=e.eattr, lho=0)
+                            comp2 = deflate(xdata)
+                            lho2 = o.tell()
+                            write_local(o, xe, 8, zlib.crc32(xdata) & 0xffffffff, len(comp2), len(xdata), comp2)
+                            new_cd.append((xe, 8, zlib.crc32(xdata) & 0xffffffff, len(comp2), len(xdata), lho2))
+                        extras = []
                 else:
                     n = local_record_len(mm, e)
                     lho = o.tell()
@@ -187,7 +195,7 @@ def main():
             o.write(struct.pack("<IHHHHIIH", 0x06054b50, 0, 0, len(new_cd), len(new_cd),
                                 cd_size, cd_off, len(comment)))
             o.write(comment)
-            print("重打包完成：%s（条目 %d，替换 classes.dex %d 次）" % (args.dst, len(new_cd), replaced))
+            print("重打包完成：%s（条目 %d，替换条目 %d 个）" % (args.dst, len(new_cd), replaced))
         finally:
             mm.close()
     return 0

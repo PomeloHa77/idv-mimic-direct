@@ -19,6 +19,7 @@
 
 用法：
     python tools/patch_dex.py <smali目录> [--dry-run]
+    python tools/patch_dex.py <smali目录> --keep-package   # 不改包名（原包名直装版）
 """
 
 import argparse
@@ -55,6 +56,38 @@ SIG_RE = re.compile(
 )
 
 SIG_MARK = "Lcom/fj/direct/SigFix;->sigs()"
+
+# ---- 共存版：包名改名（清单侧由 tools/coexist.py 处理，两侧必须一致）--------------
+PKG_OLD = "com.netease.dwrg"
+PKG_NEW = "com.netease.dwrg.fj"
+
+# 只改这几个**真正的包名字符串**。为什么不是全树替换前缀：
+#   smali 里大量出现 Lcom/netease/dwrg/... 这种**类型描述符**，那是真实类名，
+#   改了就会 NoClassDefFoundError。这里只做「带引号的完整字符串」精确替换。
+PKG_STRINGS = [
+    (PKG_OLD + ".DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+     PKG_NEW + ".DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"),
+    (PKG_OLD + ".permission.ngpush",
+     PKG_NEW + ".permission.ngpush"),
+]
+
+
+def patch_package_strings(path, dry_run, keep_package=False):
+    if keep_package:
+        return 0
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        data = f.read()
+    out = data
+    n = 0
+    for old, new in PKG_STRINGS:
+        cnt = out.count('"' + old + '"')
+        if cnt:
+            out = out.replace('"' + old + '"', '"' + new + '"')
+            n += cnt
+    if n and not dry_run:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(out)
+    return n
 
 # ---- API 28+ SigningInfo 链路 -------------------------------------------------
 _REG = r"(?:p[0-9]+|v[0-9]+)"
@@ -217,6 +250,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("smali_dir")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--keep-package", action="store_true",
+                    help="不做共存改包名（保留 com.netease.dwrg）")
     args = ap.parse_args()
 
     root = args.smali_dir
@@ -226,6 +261,7 @@ def main():
 
     total_sig = 0
     total_siginfo = 0
+    total_pkg = 0
     touched = 0
     for path in iter_smali(root):
         n = patch_signatures(path, args.dry_run)
@@ -239,6 +275,11 @@ def main():
             total_siginfo += m
             rel = os.path.relpath(path, root)
             print("  SigningInfo 点 %-2d 处 <- %s" % (m, rel))
+        k = patch_package_strings(path, args.dry_run, args.keep_package)
+        if k:
+            total_pkg += k
+            rel = os.path.relpath(path, root)
+            print("  包名字符串 %-2d 处 <- %s" % (k, rel))
 
     proxy = os.path.join(root, PROXY_SMALI)
     hooked = set()
@@ -249,6 +290,7 @@ def main():
 
     print("签名点替换：%d 处（分布在 %d 个文件）" % (total_sig, touched))
     print("SigningInfo 点替换：%d 处" % total_siginfo)
+    print("包名字符串替换：%d 处（%s）" % (total_pkg, "已跳过" if args.keep_package else PKG_OLD + " -> " + PKG_NEW))
     print("注入点：%s" % (", ".join(sorted(hooked)) if hooked else "无"))
     if args.dry_run:
         print("(--dry-run，未写盘)")
