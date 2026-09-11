@@ -1,5 +1,6 @@
 package z.a;
 
+import java.nio.ByteBuffer;
 
 /**
  * 进程内读内存的统一入口（原 com.fj.direct.MemReader）：优先走 native 的
@@ -16,6 +17,11 @@ package z.a;
  * 所以 libnrt.so 的动态符号表里只剩一个 JNI_OnLoad。
  *
  * native 库加载失败时（比如换了 ABI）自动降级到文件路径，不会让扫描器直接崩掉。
+ *
+ * 为什么 native 版写进 ByteBuffer（direct）而不是 byte[]：用 byte[] 就得
+ * GetPrimitiveArrayCritical，那段区域里 ART 不允许 GC —— 我们一连读 3.5 GB，
+ * 等于把整个游戏进程的 GC 按住十几秒，游戏侧的表现就是持续掉帧。
+ * direct buffer 是堆外内存，native 直接写，完全不碰 GC。
  */
 final class d {
 
@@ -53,5 +59,5 @@ final class d {
      *
      * @return >=0 实际读到的字节数；<0 为 -errno（-EFAULT=未映射，-EPERM=被拒）
      */
-    static native int a(long addr, byte[] dst, int off, int len);
+    static native int a(long addr, ByteBuffer dst, int off, int len);
 }

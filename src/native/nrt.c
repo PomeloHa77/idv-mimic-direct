@@ -21,6 +21,13 @@
  *   静态一看就自曝。改成动态注册后，libnrt.so 的动态符号表里只剩一个
  *   人人都有的 JNI_OnLoad，方法名/签名只存在于绑定时用到的字符串里。
  *
+ * 为什么写进 ByteBuffer（direct buffer）而不是 byte[]：
+ *   用 byte[] 就必须 GetPrimitiveArrayCritical —— 那个区段里 ART 不许 GC，
+ *   而我们一次扫描要连着读 3.5 GB（每块 1 MB），等于把**整个游戏进程**的 GC
+ *   按住十几秒：游戏那边每次分配都在等 GC 让路，表现就是持续掉帧。
+ *   换成 direct buffer 后，native 直接往堆外内存写，完全不经 GC，
+ *   游戏进程的 GC 一点都不会被我们拖住。
+ *
  * 返回：>=0 实际读到的字节数；<0 表示 -errno（如 -EFAULT 未映射页）。
  */
 #include <jni.h>
@@ -34,7 +41,7 @@
 #define __NR_process_vm_readv 270
 #endif
 
-/* 绑定目标：z.a.d 的 static native int a(long, byte[], int, int)。
+/* 绑定目标：z.a.d 的 static native int a(long, ByteBuffer, int, int)。
  * 类名不写成明文字面量 —— 否则 `strings libnrt.so` 一眼就能看到绑定到哪个类，
  * 改成按位异或过的字节数组，运行时现拼。 */
 #define BIND_CLASS_LEN 5
@@ -57,19 +64,19 @@ static void unmask_class(char *out)
 }
 
 __attribute__((visibility("hidden")))
-static jint rd(JNIEnv *env, jclass clazz, jlong addr, jbyteArray dst, jint off, jint len)
+static jint rd(JNIEnv *env, jclass clazz, jlong addr, jobject dst, jint off, jint len)
 {
     if (len <= 0) {
         return 0;
     }
-    jbyte *buf = (*env)->GetPrimitiveArrayCritical(env, dst, NULL);
-    if (buf == NULL) {
-        return -ENOMEM;
+    void *base = (*env)->GetDirectBufferAddress(env, dst);
+    if (base == NULL) {
+        return -EINVAL;
     }
 
     struct iovec local;
     struct iovec remote;
-    local.iov_base = buf + off;
+    local.iov_base = (char *) base + off;
     local.iov_len = (size_t) len;
     remote.iov_base = (void *) (uintptr_t) addr;
     remote.iov_len = (size_t) len;
@@ -77,8 +84,6 @@ static jint rd(JNIEnv *env, jclass clazz, jlong addr, jbyteArray dst, jint off, 
     long n = syscall(__NR_process_vm_readv, (long) getpid(),
                      &local, (long) 1, &remote, (long) 1, (long) 0);
     int err = errno;
-
-    (*env)->ReleasePrimitiveArrayCritical(env, dst, buf, 0);
 
     if (n < 0) {
         return (jint) -err;
@@ -103,7 +108,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved)
 
     JNINativeMethod m;
     m.name = (char *) "a";
-    m.signature = (char *) "(J[BII)I";
+    m.signature = (char *) "(JLjava/nio/ByteBuffer;II)I";
     m.fnPtr = (void *) rd;
     if ((*env)->RegisterNatives(env, c, &m, 1) != 0) {
         return JNI_ERR;
