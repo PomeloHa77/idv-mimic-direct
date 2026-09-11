@@ -274,7 +274,15 @@ public final class OverlayWindow {
                     .append(" | 通道 ").append(r.reader)
                     .append(" | 区域 ").append(r.regions)
                 .append(" | 读取 ").append(r.bytes / 1048576).append(" MB")
-                .append(" | 命中 ").append(r.count).append("/12\n");
+                .append(" | 命中 ").append(r.count).append("/12");
+        // 命中来自哪个区域（root 版按区域分组、取角色最多的区域）；没有区域达标时
+        // 退化成全局合并，这里把两种来源区分开，方便对着 logcat 排查。
+        if (r.bestRegion != 0) {
+            sb.append(" | 采信区域 0x").append(Long.toHexString(r.bestRegion));
+        } else if (r.mergedCount > 0) {
+            sb.append(" | 全局合并 ").append(r.mergedCount).append(" 个编号");
+        }
+        sb.append('\n');
         if (r.error != null) {
             sb.append("错误：").append(r.error).append('\n');
         }

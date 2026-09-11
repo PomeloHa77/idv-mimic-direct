@@ -27,7 +27,7 @@
 |---|---|---|
 | 文件 | `out/第五人格-共存版-2026.0828.1653.apk` | `out/第五人格-直装版-2026.0828.1653.apk` |
 | 大小 | 2 012 868 396 B | 2 012 868 324 B |
-| SHA-256 | `ac5afd1bc0a80dea39b14bffb88fdbe5d1e621d3e1dad1b3ffa80c692df50aa8` | `fb3cb387911084dd3319e3b4721c398c0a509503bb430c415b080f765fc42844` |
+| SHA-256 | `a0875e325f78c7c64e14ec93febbc458343c3f647476dfe009cffe4714072720` | `fb3cb387911084dd3319e3b4721c398c0a509503bb430c415b080f765fc42844` |
 | 包名 | **`com.netease.dwrg.fj`** | `com.netease.dwrg`（与官方一致） |
 | 与官方包共存 | 可以，可同时安装、同时登录 | 不行，必须先卸载官方包 |
 | 安装命令 | `adb install -r "out\第五人格-共存版-2026.0828.1653.apk"` | `adb uninstall com.netease.dwrg` 后再 `adb install -r "out\第五人格-直装版-2026.0828.1653.apk"` |
@@ -285,7 +285,7 @@ id=0x7109871a len=1491   ← 只有标准 v2 块
 `null`，重签后 apksigner 写入的仍只有 `0x7109871a`（`checkV2()` 依旧为 true、
 `getChannel()` 依旧返回 `null`）——**前后行为完全一致，无需硬编码渠道值**。
 
-### 4.3 `classes13.dex`：新增（23 272 B，纯 Java）
+### 4.3 `classes13.dex`：新增（25 488 B，纯 Java）
 
 与 `classes.dex` 分离编译（`javac --release 8` + `d8 --min-api 21`），
 避开 64K 方法数/寄存器压力，也把回编译风险隔离在一个文件里。
@@ -353,6 +353,39 @@ process_vm_rw() → mm_access() → ptrace_may_access() → __ptrace_may_access(
 耗时 7196 ms | 通道 process_vm_readv | 区域 1182 | 读取 3072 MB | 命中 0/12
 ```
 
+### 4.5 注入点会命中的**所有**进程：非主进程必须不注入（真机踩过这个坑）
+
+注入点 `UFProxyApplication` 是这个 app 的 `android:name`，而 **Application 在 app 的每个进程里
+都会被创建** —— 这个包里除了游戏主进程，还有一个 `:PushService`（网易推送，清单里声明为
+`com.netease.pushservice.PushService` + `android:process=":PushService"`）。
+
+不拦的后果（真机上就是这么踩的）：
+
+* 两个进程各建一个**位置完全重叠、长得一模一样**的悬浮窗，你点到的很可能是推送进程那个；
+* 而扫描器读的是 `/proc/self/maps`（即「自己这个进程」），在推送进程里读到的是**推送进程的
+  地址空间**，一个角色都不会有 —— 表现为不管在不在对局，永远「未命中任何角色」。
+
+所以 `Boot` 里加了主进程判定，判定不通过就**不注入**（不建悬浮窗）：
+
+```java
+// /proc/self/cmdline 全版本可用、零反射风险；取不到再退回 ActivityThread.currentProcessName()
+String me  = processName();          // "com.netease.dwrg.fj" 或 "com.netease.dwrg.fj:PushService"
+String pkg = ctx.getPackageName();   // "com.netease.dwrg.fj"
+return me == null || pkg == null || me.equals(pkg);
+```
+
+两个进程各自的 `logcat` 长这样（真机 2026-09-11）：
+
+```
+09-11 16:09:24.625 13099 13099 I FJDirect: 进程判定：cmdline=com.netease.dwrg.fj 包名=com.netease.dwrg.fj 主进程=true
+09-11 16:09:24.625 13099 13099 I FJDirect: Boot.boot 注入成功，context=true
+09-11 16:09:25.691 13099 13099 I FJDirect: 悬浮窗已创建
+09-11 16:11:59.371 20563 20563 I FJDirect: 进程判定：cmdline=com.netease.dwrg.fj:PushService 包名=com.netease.dwrg.fj 主进程=false
+```
+
+判定之后 `dumpsys window windows` 里属于本 app、`appop=SYSTEM_ALERT_WINDOW` 的窗口**始终只有 1 个**，
+且它的 `mSession` 指向主进程 pid。
+
 ## 5. 扫描器细节（与 root 版行为对齐）
 
 特征码、字段偏移、守卫**完全沿用** root 版 `模仿者遍历.cpp`：
@@ -378,7 +411,14 @@ i+0  ==105(i) i+1==100(d) i+2==120(x) i+5==99(c) i+6==97(a) i+14==105 i+23==105
 * 读失败（未驻留页 → `EIO`）按 4096 页步进跳过并计数，不中断整体扫描；
 * 单次扫描字节上限 8 GB，防止极端情况下长时间占用（真机实测：3 GB 只要 7 s，
   原定的 3 GB 上限会在扫完之前被截断，故放宽到 8 GB）；
-* 12 个编号各留**首个**命中，集满 12 个提前结束；
+* **按区域分组取最优**：命中先按 `rw-anon` 区域各算一份（区域内按编号去重、取首个命中），
+  最后采信「命中编号最多」的那个区域 —— 对齐 root 版按 `roleCount` 降序取模块的策略。
+  为什么必须这么做：进程里同时存在上一局残留、序列化副本等干扰数据，全局「首个命中」
+  很容易混进过期的编号；而角色数据是 12 个人共用的同一张表，按区域取最全的那份才对得上；
+  某个区域集满 12 个编号就立刻结束扫描；
+* **兜底**：没有任何区域到 5 个编号时（比如刚进对局、数据还没写全），退回
+  「全局按编号去重取首个命中」，宁可少报也不空手；结果行会标出是「采信区域」还是
+  「全局合并」，方便对着 `logcat` 区分来源；
 * 全程后台线程（`FJDirect-scan`），按钮上显示耗时（ms）。
 
 ---
@@ -453,7 +493,7 @@ SHA-256: 80:65:1B:C5:39:7A:0B:C1:26:88:C2:F3:E4:5E:BE:88:72:F9:8C:3C:49:AC:69:86
 | `zipalign -c -v 4` | `Verification successful` |
 | `aapt2 dump badging` | 共存版 `com.netease.dwrg.fj` / 直装版 `com.netease.dwrg`；版本号不变、含 `SYSTEM_ALERT_WINDOW`、`native-code: 'arm64-v8a'` |
 | `resources.arsc` 包名 | `com.netease.dwrg.fj`（共存版），仍为 STORED、3 788 696 B 不变 |
-| `classes13.dex` magic | `dex\n035`，23 272 B，`dexdump -f` 解析正常 |
+| `classes13.dex` magic | `dex\n035`，25 488 B，`dexdump -f` 解析正常 |
 | `libmmread.so` | aarch64 ELF、4 408 B、只导出 `Java_com_fj_direct_MemReader_readSelf` |
 | 逆向复核（把成品 `classes.dex` 反编译回来再数） | `Boot;->boot(` = **1**、`Boot;->ensure(` = **1**、`SigFix;->sigs()` = **18**、残留 `SigningInfo;->` 调用 = **0**、残留 `PackageInfo;->signatures` 读取 = **0**、残留旧包名字符串 = **0** |
 | zip 逐条对比 | 共存版：`AndroidManifest.xml` / `classes.dex` / `resources.arsc` 变化，新增 `classes13.dex`、`libmmread.so`、`FJDIRECT.*`；原有条目顺序与字节完全一致（见 4.1 节） |
@@ -494,8 +534,10 @@ adb install -r "out\第五人格-直装版-2026.0828.1653.apk"
 | 与官方共存 | 设备上的官方包是 **4399 渠道版 `com.netease.dwrg.m4399`**，与 `com.netease.dwrg.fj` 互不影响，两个客户端都在 |
 | 启动 | 正常进到游戏（登录界面 + 维护公告），**黑屏已消失** |
 | 悬浮窗 | `FJDirect: 悬浮窗已创建`，屏幕上左上角显示「模仿者·直装 / 扫描 / 复制」 |
+| 悬浮窗归属 | 属于本 app 的 `SYSTEM_ALERT_WINDOW` 窗口**只有 1 个**，`mSession` = 主进程 pid；`:PushService` 进程不再建窗（见 4.5 节） |
 | 扫描（不在对局） | `耗时 2384 ms｜通道 process_vm_readv｜区域 457｜读取 1244 MB｜命中 0/12`（整轮扫完、没触发上限；不在对局所以没有命中，符合预期） |
-| 兜底文件 | `/storage/emulated/0/Android/data/com.netease.dwrg.fj/files/scan.txt` 同步写出结果 |
+| 扫描（游戏加载中） | `耗时 6877 ms｜通道 process_vm_readv｜区域 1293｜读取 3475 MB｜命中 0/12`（同上，未触发 8 GB 上限） |
+| 兜底文件 | `/storage/emulated/0/Android/data/com.netease.dwrg.fj/files/scan.txt` 同步写出结果，内容与悬浮窗一致 |
 | 待你验证 | 登录进游戏 → 进「模仿者」对局 → 点「扫描」，看是否出现编号 1–12 |
 
 ### 7.3 失败定位判据

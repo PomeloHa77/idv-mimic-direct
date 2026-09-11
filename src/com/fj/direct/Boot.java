@@ -3,6 +3,8 @@ package com.fj.direct;
 import android.content.Context;
 import android.util.Log;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
 import java.lang.reflect.Method;
 
 /**
@@ -21,6 +23,10 @@ public final class Boot {
 
     private static volatile Context sCtx;
     private static volatile boolean sBooted;
+    /** 已经判定过「不是主进程」，后续调用直接返回（避免 onCreate 再走一遍）。 */
+    private static volatile boolean sSkipped;
+    /** 主进程判定结果缓存：null=未判定。 */
+    private static volatile Boolean sMain;
 
     private Boot() {
     }
@@ -40,6 +46,11 @@ public final class Boot {
             if (sBooted) {
                 return;
             }
+            // 关键：只在游戏主进程里装悬浮窗。见 isMainProcess() 的注释。
+            if (sCtx != null && !isMainProcess(sCtx)) {
+                sSkipped = true;
+                return;
+            }
             sBooted = true;
             Log.i(TAG, "Boot.boot 注入成功，context=" + (sCtx != null));
             OverlayWindow.scheduleInstall(sCtx);
@@ -54,6 +65,13 @@ public final class Boot {
             if (sCtx == null) {
                 sCtx = resolveApplication();
             }
+            if (sSkipped) {
+                return;
+            }
+            if (sCtx != null && !isMainProcess(sCtx)) {
+                sSkipped = true;
+                return;
+            }
             Log.i(TAG, "Boot.ensure context=" + (sCtx != null));
             if (sCtx != null) {
                 OverlayWindow.scheduleInstall(sCtx);
@@ -61,6 +79,81 @@ public final class Boot {
         } catch (Throwable t) {
             Log.e(TAG, "Boot.ensure 失败", t);
         }
+    }
+
+    /**
+     * 当前进程是不是游戏主进程。
+     *
+     * 为什么必须拦：注入点 UFProxyApplication 是这个 app 的 Application 类，
+     * 而 Application 在 app 的**每个进程**里都会被创建 —— 这里至少还有
+     * com.netease.dwrg.fj:PushService（网易推送进程）。如果每个进程都建悬浮窗，
+     * 手机上会出现两个位置完全重叠、长得一模一样的小窗，点到的很可能是推送进程那个；
+     * 而扫描器读的是 /proc/self/maps（即「自己这个进程」），在推送进程里读到的
+     * 是推送进程的地址空间，角色数据一个都不会有 —— 表现为永远「未命中任何角色」。
+     * 扮演者的角色数据只存在游戏主进程里，所以：不是主进程就直接不注入。
+     *
+     * 判定用 /proc/self/cmdline（全版本可用、零反射风险），拿不到再退回
+     * ActivityThread.currentProcessName()。两者都失败时按「是主进程」处理（不误伤）。
+     */
+    private static boolean isMainProcess(Context ctx) {
+        Boolean cached = sMain;
+        if (cached != null) {
+            return cached;
+        }
+        boolean main = true;
+        try {
+            String me = processName();
+            String pkg = ctx != null ? ctx.getPackageName() : null;
+            if (me != null && pkg != null) {
+                main = me.equals(pkg);
+            }
+            Log.i(TAG, "进程判定：cmdline=" + me + " 包名=" + pkg + " 主进程=" + main);
+        } catch (Throwable t) {
+            Log.w(TAG, "进程名判定失败，按主进程处理：" + t);
+        }
+        sMain = main;
+        return main;
+    }
+
+    /** 读 /proc/self/cmdline；失败退回反射 ActivityThread.currentProcessName()。 */
+    private static String processName() {
+        BufferedReader br = null;
+        try {
+            br = new BufferedReader(new FileReader("/proc/self/cmdline"));
+            String s = br.readLine();
+            if (s != null) {
+                int z = s.indexOf('\0');
+                if (z >= 0) {
+                    s = s.substring(0, z);
+                }
+                s = s.trim();
+                if (!s.isEmpty()) {
+                    return s;
+                }
+            }
+        } catch (Throwable ignore) {
+            // 退回反射
+        } finally {
+            if (br != null) {
+                try {
+                    br.close();
+                } catch (Throwable ignore) {
+                    // ignore
+                }
+            }
+        }
+        try {
+            Method m = Class.forName("android.app.ActivityThread")
+                    .getDeclaredMethod("currentProcessName");
+            m.setAccessible(true);
+            Object o = m.invoke(null);
+            if (o instanceof String) {
+                return (String) o;
+            }
+        } catch (Throwable ignore) {
+            // ignore
+        }
+        return null;
     }
 
     /** 反射兜底：ActivityThread.currentApplication()。 */
