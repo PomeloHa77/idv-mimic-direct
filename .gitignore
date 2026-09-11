@@ -1,0 +1,28 @@
+# ---- 大体积 / 机器相关产物，绝不入库 ----
+# 原始游戏包 1.88 GB，重新分发它是侵权的，也远超 GitHub 限制
+*.apk
+netease_dwrg_*.apk
+
+# 构建中间产物（smali 树、dex、重打包结果，合计数 GB）
+work/
+out/
+
+# 签名密钥：只在本机保留，泄露等于别人能签出"同一个"包
+*.keystore
+*.jks
+
+# 工具 jar：README 里给了下载地址与 SHA256，不入库
+tools/*.jar
+libs/*.jar
+
+# 编译产物
+tools/build/
+work/tools-build/
+__pycache__/
+*.pyc
+*.class
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
