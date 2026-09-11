@@ -1,6 +1,5 @@
-package com.fj.direct;
+package z.a;
 
-import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
@@ -28,9 +27,8 @@ import java.util.ArrayList;
  * 作为结果（原版是 roleCount 降序取模块）；没有任何区域集齐 5 个编号时，
  * 退回「全局按编号去重取首个命中」，宁可少报也不空手。
  */
-public final class MemScanner {
+public final class c {
 
-    public static final String TAG = "FJDirect";
 
     /** 单次读取块大小。 */
     private static final int CHUNK = 1 << 20;
@@ -83,7 +81,7 @@ public final class MemScanner {
         }
     }
 
-    private MemScanner() {
+    private c() {
     }
 
     public static Result scanOnce() {
@@ -91,12 +89,12 @@ public final class MemScanner {
         long t0 = System.currentTimeMillis();
         ArrayList<long[]> regs = readRegions();
         r.regions = regs.size();
-        Log.i(TAG, "扫描开始：rw 匿名区域 " + regs.size() + " 个");
+        i.i("扫描开始：rw 匿名区域 " + regs.size() + " 个");
 
         // 优先 native（process_vm_readv 自读，Android 10+ 也能用），
         // 退回 /proc/self/mem（Android 9 及以下可用，10+ 会被 SELinux 拒）。
         RandomAccessFile mem = null;
-        boolean useNative = MemReader.nativeOk();
+        boolean useNative = d.nativeOk();
         if (useNative) {
             r.memOk = true;
             r.reader = "process_vm_readv";
@@ -108,9 +106,9 @@ public final class MemScanner {
             } catch (Throwable t) {
                 r.memOk = false;
                 r.error = "打开 /proc/self/mem 失败，且 native 通道不可用（"
-                        + MemReader.nativeErr() + "）：" + t;
+                        + d.nativeErr() + "）：" + t;
                 r.millis = System.currentTimeMillis() - t0;
-                Log.e(TAG, r.error);
+                i.e(r.error);
                 return r;
             }
         }
@@ -139,7 +137,7 @@ public final class MemScanner {
                     int n;
                     try {
                         if (useNative) {
-                            n = MemReader.readSelf(addr, buf, 0, want);
+                            n = d.a(addr, buf, 0, want);
                             if (n < 0) {
                                 n = 0;          // -errno：该段不可读，按页跳过
                             }
@@ -170,7 +168,7 @@ public final class MemScanner {
                 }
             }
             if (unreadable > 0) {
-                Log.i(TAG, "不可读页跳过次数：" + unreadable);
+                i.i("不可读页跳过次数：" + unreadable);
             }
 
             // 取「命中编号最多」的区域（root 版的 roleCount 排序策略）。
@@ -182,7 +180,7 @@ public final class MemScanner {
                 }
             }
             if (best != null && best.count > 0) {
-                Log.i(TAG, "最佳区域 0x" + Long.toHexString(best.start) + " 命中编号 "
+                i.i("最佳区域 0x" + Long.toHexString(best.start) + " 命中编号 "
                         + best.count + "/12（共 " + stats.size() + " 个区域）");
             }
             // 兜底：没有任何区域集齐 5 个编号时（比如对局刚开始、数据还没写全），
@@ -226,7 +224,7 @@ public final class MemScanner {
             }
         } catch (Throwable t) {
             r.error = "扫描异常：" + t;
-            Log.e(TAG, r.error, t);
+            i.e(r.error, t);
         } finally {
             if (mem != null) {
                 try {
@@ -238,7 +236,7 @@ public final class MemScanner {
         }
 
         r.millis = System.currentTimeMillis() - t0;
-        Log.i(TAG, "扫描结束：" + r.reader + " 通道，命中编号 " + r.count + " 个，读取 " + r.bytes
+        i.i("扫描结束：" + r.reader + " 通道，命中编号 " + r.count + " 个，读取 " + r.bytes
                 + " 字节，耗时 " + r.millis + " ms");
         return r;
     }
@@ -330,7 +328,7 @@ public final class MemScanner {
                 out.add(new long[] { start, end });
             }
         } catch (Throwable t) {
-            Log.e(TAG, "读取 /proc/self/maps 失败", t);
+            i.e("读取 /proc/self/maps 失败", t);
         } finally {
             if (br != null) {
                 try {
@@ -348,8 +346,8 @@ public final class MemScanner {
         int n = 0;
         for (int i = 0; i < 12; i++) {
             if (r.found[i]) {
-                out[n++] = "编号" + (i + 1) + " : " + RoleTable.campName(r.camp[i]) + "丨"
-                        + RoleTable.nameOf(r.role[i]);
+                out[n++] = "编号" + (i + 1) + " : " + e.campName(r.camp[i]) + "丨"
+                        + e.nameOf(r.role[i]);
             }
         }
         String[] real = new String[n];

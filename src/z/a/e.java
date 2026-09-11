@@ -1,4 +1,4 @@
-package com.fj.direct;
+package z.a;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -10,7 +10,7 @@ import java.util.Map;
  *   - 新版本单字节角色索引：45~52 / 101~118 / 201~209，0 = 狼
  *   - 旧版本长整型角色 ID（游戏改版前使用，保留以兼容 / 备查）
  */
-public final class RoleTable {
+public final class e {
 
     private static final Map<Integer, String> MAP = new HashMap<Integer, String>();
 
@@ -96,7 +96,7 @@ public final class RoleTable {
         put(0, "狼");
     }
 
-    private RoleTable() {
+    private e() {
     }
 
     public static String nameOf(int roleId) {

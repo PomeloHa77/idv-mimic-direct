@@ -4,12 +4,12 @@
 
 四类补丁：
   1) 注入入口：在 UFProxyApplication.attachBaseContext / onCreate 的 super 调用之后，
-     插入 com.fj.direct.Boot 的调用（boot/ensure 内部自带去重）。
-  2) 签名回填：全树把 `PackageInfo->signatures` 的读取替换成 SigFix.sigs()，
+     插入 z.a.a 的调用（两个方法内部自带去重，类名已中性化）。
+  2) 签名回填：全树把 `PackageInfo->signatures` 的读取替换成 z.a.b.a()，
      解决重打包换签名导致网易 SDK/支付/热更新校验失败的问题。
   3) 签名回填（API 28+ 的 SigningInfo 链路）：把 `PackageInfo->signingInfo` +
      `SigningInfo->hasMultipleSigners/getApkContentsSigners/getSigningCertificateHistory`
-     这段内联代码换成 SigFix.sigs()。漏掉这条链，Android 9+ 上仍会读到我们自己的真实签名。
+     这段内联代码换成 z.a.b.a()。漏掉这条链，Android 9+ 上仍会读到我们自己的真实签名。
   4) 签名回填（ngplugin 的反射桥 C.l/C.m/C.r）：这三个 bridge 方法是 mpay/d、
      mpay/login/c$c 读取 SigningInfo 的唯一出口，整体改写为常量。
 
@@ -39,14 +39,14 @@ HOOKS = [
             r"^([ \t]*)invoke-super \{p0, p1\}, Landroid/app/Application;->"
             r"attachBaseContext\(Landroid/content/Context;\)V\s*$"
         ),
-        "invoke-static {p1}, Lcom/fj/direct/Boot;->boot(Landroid/content/Context;)V",
+        "invoke-static {p1}, Lz/a/a;->a(Landroid/content/Context;)V",
     ),
     (
         "onCreate",
         re.compile(
             r"^([ \t]*)invoke-super/range \{p0 \.\. p0\}, Landroid/app/Application;->onCreate\(\)V\s*$"
         ),
-        "invoke-static {}, Lcom/fj/direct/Boot;->ensure()V",
+        "invoke-static {}, Lz/a/a;->b()V",
     ),
 ]
 
@@ -55,7 +55,34 @@ SIG_RE = re.compile(
     r"Landroid/content/pm/PackageInfo;->signatures:\[Landroid/content/pm/Signature;\s*$"
 )
 
-SIG_MARK = "Lcom/fj/direct/SigFix;->sigs()"
+SIG_MARK = "Lz/a/b;->a()"
+
+# ---- 老版本残留的旧类名（com.fj.direct.*）迁移 -----------------------------------
+# 为什么需要：smali 树是复用的（build.ps1 -SkipDecompile 不重新反编译），而补丁
+# 本身是幂等的 —— 类名一改，新串在旧树上找不到匹配，旧的注入调用就会留在原地，
+# 真机表现是启动即 java.lang.ClassNotFoundException: com.fj.direct.Boot 然后自杀。
+# 所以每次打补丁都先做一次「旧 -> 新」的原地迁移。
+LEGACY = [
+    ("Lcom/fj/direct/Boot;->boot(Landroid/content/Context;)V", "Lz/a/a;->a(Landroid/content/Context;)V"),
+    ("Lcom/fj/direct/Boot;->ensure()V", "Lz/a/a;->b()V"),
+    ("Lcom/fj/direct/SigFix;->sigs()", "Lz/a/b;->a()"),
+]
+
+
+def migrate_legacy(path, dry_run):
+    """把旧版注入的 com.fj.direct.* 调用改成新类名。返回改动条数。"""
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        data = f.read()
+    out = data
+    n = 0
+    for old, new in LEGACY:
+        if old in out:
+            n += out.count(old)
+            out = out.replace(old, new)
+    if n and not dry_run:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(out)
+    return n
 
 # ---- 共存版：包名改名（清单侧由 tools/coexist.py 处理，两侧必须一致）--------------
 PKG_OLD = "com.netease.dwrg"
@@ -108,7 +135,7 @@ RE_HAS_MULTI = re.compile(
 )
 
 
-# 内联块 2/3：getApkContentsSigners() / getSigningCertificateHistory() -> SigFix.sigs()
+# 内联块 2/3：getApkContentsSigners() / getSigningCertificateHistory() -> z.a.b.a()
 def _inline_signers_re(method):
     return re.compile(
         r"^([ \t]*)iget-object (" + _REG + r"), " + _REG + r", " + _SIGNING_INFO_FIELD + _SEP
@@ -262,8 +289,13 @@ def main():
     total_sig = 0
     total_siginfo = 0
     total_pkg = 0
+    total_legacy = 0
     touched = 0
     for path in iter_smali(root):
+        lg = migrate_legacy(path, args.dry_run)
+        if lg:
+            total_legacy += lg
+            print("  旧类名迁移 %-2d 处 <- %s" % (lg, os.path.relpath(path, root)))
         n = patch_signatures(path, args.dry_run)
         if n:
             total_sig += n
@@ -290,6 +322,7 @@ def main():
 
     print("签名点替换：%d 处（分布在 %d 个文件）" % (total_sig, touched))
     print("SigningInfo 点替换：%d 处" % total_siginfo)
+    print("旧类名迁移：%d 处" % total_legacy)
     print("包名字符串替换：%d 处（%s）" % (total_pkg, "已跳过" if args.keep_package else PKG_OLD + " -> " + PKG_NEW))
     print("注入点：%s" % (", ".join(sorted(hooked)) if hooked else "无"))
     if args.dry_run:

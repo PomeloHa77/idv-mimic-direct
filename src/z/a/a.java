@@ -1,26 +1,24 @@
-package com.fj.direct;
+package z.a;
 
 import android.app.Application;
 import android.content.Context;
-import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.lang.reflect.Method;
 
 /**
- * 注入入口。
+ * 注入入口（原 com.fj.direct.Boot，类名改短名以去掉 dex 里的自曝特征）。
  *
  * 由 smali 补丁在 com.netease.ntunisdk.unifix_hotfix_library.proxyApplication.UFProxyApplication
  * 的 attachBaseContext / onCreate 中调用：
- *   attachBaseContext → Boot.boot(Landroid/content/Context;)
- *   onCreate          → Boot.ensure()
+ *   attachBaseContext → a.a(Landroid/content/Context;)V
+ *   onCreate          → a.b()V
  *
  * 逻辑必须极轻：这里只保存 Context 并 post 到主线程去建悬浮窗，不做同步耗时操作。
  */
-public final class Boot {
+public final class a {
 
-    private static final String TAG = "FJDirect";
 
     private static volatile Context sCtx;
     private static volatile boolean sBooted;
@@ -29,11 +27,11 @@ public final class Boot {
     /** 主进程判定结果缓存：null=未判定。 */
     private static volatile Boolean sMain;
 
-    private Boot() {
+    private a() {
     }
 
     /** 来自 attachBaseContext（有 Context）。 */
-    public static void boot(Context ctx) {
+    public static void a(Context ctx) {
         try {
             if (ctx != null) {
                 Context app = null;
@@ -53,16 +51,16 @@ public final class Boot {
                 return;
             }
             sBooted = true;
-            Log.i(TAG, "Boot.boot 注入成功，context=" + (sCtx != null));
+            i.i("注入成功，context=" + (sCtx != null));
             installKeyToggle(sCtx);
-            OverlayWindow.scheduleInstall(sCtx);
+            f.scheduleInstall(sCtx);
         } catch (Throwable t) {
-            Log.e(TAG, "Boot.boot 失败", t);
+            i.e("注入失败", t);
         }
     }
 
     /** 来自 onCreate（无参，兜底重试）。 */
-    public static void ensure() {
+    public static void b() {
         try {
             if (sCtx == null) {
                 sCtx = resolveApplication();
@@ -74,13 +72,13 @@ public final class Boot {
                 sSkipped = true;
                 return;
             }
-            Log.i(TAG, "Boot.ensure context=" + (sCtx != null));
+            i.i("兜底重试 context=" + (sCtx != null));
             if (sCtx != null) {
                 installKeyToggle(sCtx);
-                OverlayWindow.scheduleInstall(sCtx);
+                f.scheduleInstall(sCtx);
             }
         } catch (Throwable t) {
-            Log.e(TAG, "Boot.ensure 失败", t);
+            i.e("兜底重试失败", t);
         }
     }
 
@@ -88,17 +86,17 @@ public final class Boot {
     private static void installKeyToggle(Context ctx) {
         try {
             if (ctx instanceof Application) {
-                KeyToggle.install((Application) ctx);
+                g.install((Application) ctx);
                 return;
             }
             Context app = resolveApplication();
             if (app instanceof Application) {
-                KeyToggle.install((Application) app);
+                g.install((Application) app);
             } else {
-                Log.w(TAG, "拿不到 Application：音量键开关未装（悬浮窗的按钮不受影响）");
+                i.w("拿不到 Application：音量键开关未装（悬浮窗的按钮不受影响）");
             }
         } catch (Throwable t) {
-            Log.w(TAG, "装音量键开关失败：" + t);
+            i.w("装音量键开关失败：" + t);
         }
     }
 
@@ -128,9 +126,9 @@ public final class Boot {
             if (me != null && pkg != null) {
                 main = me.equals(pkg);
             }
-            Log.i(TAG, "进程判定：cmdline=" + me + " 包名=" + pkg + " 主进程=" + main);
+            i.i("进程判定：cmdline=" + me + " 包名=" + pkg + " 主进程=" + main);
         } catch (Throwable t) {
-            Log.w(TAG, "进程名判定失败，按主进程处理：" + t);
+            i.w("进程名判定失败，按主进程处理：" + t);
         }
         sMain = main;
         return main;
@@ -188,7 +186,7 @@ public final class Boot {
                 return (Context) app;
             }
         } catch (Throwable t) {
-            Log.w(TAG, "反射获取 Application 失败：" + t);
+            i.w("反射获取 Application 失败：" + t);
         }
         return null;
     }

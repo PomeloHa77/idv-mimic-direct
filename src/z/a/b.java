@@ -1,10 +1,10 @@
-package com.fj.direct;
+package z.a;
 
 import android.content.pm.Signature;
 import android.util.Base64;
 
 /**
- * 官方签名回填。
+ * 官方签名回填（原 com.fj.direct.SigFix）。
  *
  * 重打包必然换签名，而网易 SDK（ntunisdk / mpay / UniFix 热更新 / 渠道判定）会把
  * PackageInfo.signatures 上报服务器校验，签名一变就登录失败。这里把原包的官方证书
@@ -12,9 +12,9 @@ import android.util.Base64;
  * 918e39b4e77e4e1e03a7c0236c6f473037851069c67b5ebecf60e9b9744e4dc9）直接返回，
  * 使 toCharsString()/toByteArray()/MD5/SHA1 等一切派生值都与官方一致。
  *
- * smali 侧把所有 `PackageInfo->signatures` 的读取替换成 SigFix.sigs()。
+ * smali 侧把所有 `PackageInfo->signatures` 的读取替换成 b.a()。
  */
-public final class SigFix {
+public final class b {
 
     private static final String OFFICIAL_CERT_B64 =
             "MIIDSTCCAjGgAwIBAgIEdY1R1TANBgkqhkiG9w0BAQsFADBUMQswCQYDVQQGEwJjbjELMAkGA1UECBMCemoxCzAJBgNVBAcT"
@@ -32,14 +32,14 @@ public final class SigFix {
 
     private static volatile Signature[] sCache;
 
-    private SigFix() {
+    private b() {
     }
 
     /** 供 smali 补丁替换 PackageInfo->signatures 使用。 */
-    public static Signature[] sigs() {
+    public static Signature[] a() {
         Signature[] s = sCache;
         if (s == null) {
-            synchronized (SigFix.class) {
+            synchronized (b.class) {
                 s = sCache;
                 if (s == null) {
                     byte[] der = Base64.decode(OFFICIAL_CERT_B64, Base64.DEFAULT);
@@ -49,10 +49,5 @@ public final class SigFix {
             }
         }
         return s;
-    }
-
-    /** 官方签名 hex 串（等价 Signature.toCharsString()，排错用）。 */
-    public static String charsString() {
-        return sigs()[0].toCharsString();
     }
 }
