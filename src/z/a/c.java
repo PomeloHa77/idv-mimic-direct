@@ -4,6 +4,7 @@ package z.a;
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 
 /**
@@ -41,6 +42,25 @@ public final class c {
      * 有可能把真正存角色的区域漏在后面，所以放宽到 8 GB。
      */
     private static final long BYTE_BUDGET = 8L << 30;
+
+    /**
+     * native 通道的落地缓冲区：**必须是 direct buffer**。
+     *
+     * 用 byte[] 就得 GetPrimitiveArrayCritical，那段区域里 ART 不许 GC；
+     * 我们连读 3.5 GB（每块 1 MB），等于把游戏进程的 GC 按住十几秒 ——
+     * 游戏每次分配都在等 GC，表现就是掉帧/转视角卡。直接读进堆外内存后，
+     * GC 完全不受影响（代价是每块多一次 1 MB 内存拷贝，约 0.1 ms，可忽略）。
+     */
+    private static final ByteBuffer DIRECT = ByteBuffer.allocateDirect(CHUNK + LOOKAHEAD);
+
+    /**
+     * 每读这么多字节就让一次 CPU（sleep 让出调度）。
+     *
+     * 为什么：扫描是「读 3.5 GB + 逐字节比对」的纯 CPU/内存活，虽然跑在后台线程，
+     * 但持续占满一个核 + 打满内存带宽，会让游戏的渲染线程抢不到时间片（表现同样是掉帧）。
+     * 32 MB 让 2 ms，全程只多花 ~0.2 s，换来的是游戏帧率几乎不受影响。
+     */
+    private static final long YIELD_EVERY = 32L << 20;
 
     public static final class Result {
         public final boolean[] found = new boolean[12];
@@ -87,6 +107,18 @@ public final class c {
     public static Result scanOnce() {
         Result r = new Result();
         long t0 = System.currentTimeMillis();
+        // 后台优先级：让游戏的主线程/渲染线程在调度上永远压我们一头。
+        //
+        // 为什么是 BACKGROUND（nice 10）而不是 LOWEST（nice 19）：真机实测 nice 19
+        // 会被内核对到小核上、再被其它后台任务分掉，3.6 GB 要读 20 s（≈180 MB/s），
+        // 对局中途等不起；nice 10 的权重是 nice 0 的 1/9，游戏线程（0 甚至 -10）
+        // 依然稳压我们，而扫描能跑在 5 s 上下。这个刻度是「游戏优先」和「能用」的平衡点。
+        try {
+            android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_BACKGROUND);
+        } catch (Throwable ignore) {
+            // ignore
+        }
         ArrayList<long[]> regs = readRegions();
         r.regions = regs.size();
         i.i("扫描开始：rw 匿名区域 " + regs.size() + " 个");
@@ -115,6 +147,7 @@ public final class c {
 
         byte[] buf = new byte[CHUNK + LOOKAHEAD];
         ArrayList<RegionStat> stats = new ArrayList<RegionStat>(regs.size());
+        long nextYield = YIELD_EVERY;
         try {
             int unreadable = 0;
             boolean full = false;
@@ -137,9 +170,14 @@ public final class c {
                     int n;
                     try {
                         if (useNative) {
-                            n = d.a(addr, buf, 0, want);
+                            // 读进堆外缓冲（不碰 GC），再整体拷回 byte[] 供扫描
+                            n = d.a(addr, DIRECT, 0, want);
                             if (n < 0) {
                                 n = 0;          // -errno：该段不可读，按页跳过
+                            } else if (n > 0) {
+                                DIRECT.clear();
+                                DIRECT.limit(n);
+                                DIRECT.get(buf, 0, n);
                             }
                         } else {
                             mem.seek(addr);
@@ -155,6 +193,15 @@ public final class c {
                         continue;
                     }
                     r.bytes += n;
+                    // 让 CPU 喘口气：游戏抢不到时间片时，「卡顿」比「扫描慢一点」难受得多
+                    if (r.bytes >= nextYield) {
+                        nextYield = r.bytes + YIELD_EVERY;
+                        try {
+                            Thread.sleep(2L);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
                     scanBuffer(buf, n, stat);
                     if (stat.count >= 12) {
                         // 这个区域 12 个编号齐全，不可能有更好的了，直接收工
